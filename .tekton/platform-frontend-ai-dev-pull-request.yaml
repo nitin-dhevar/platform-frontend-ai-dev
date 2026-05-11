@@ -179,8 +179,20 @@ spec:
             echo "Setting up test environment..."
             mkdir -p $HOME $UV_CACHE_DIR
 
+            echo "Current directory: $(pwd)"
+            echo "Listing workspace contents:"
+            ls -la
+
             echo "Installing uv..."
             pip install --no-cache-dir uv
+
+            # Check if skill directory exists
+            if [ ! -d ".claude/skills/post-pr" ]; then
+              echo "ERROR: .claude/skills/post-pr not found!"
+              echo "Searching for post-pr skill..."
+              find . -name "post-pr" -type d
+              exit 1
+            fi
 
             echo "Running post-pr skill tests..."
             cd .claude/skills/post-pr
