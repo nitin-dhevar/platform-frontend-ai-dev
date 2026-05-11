@@ -35,6 +35,8 @@ var (
 	jiraURL      = flag.String("jira-url", "", "upstream Jira URL")
 	jiraUsername  = flag.String("jira-username", "", "Jira username")
 	jiraToken    = flag.String("jira-token", "", "Jira API token")
+
+	screenshotListen = flag.String("screenshot-listen", ":8446", "screenshot upload proxy listen address")
 )
 
 type server struct {
@@ -215,6 +217,9 @@ func main() {
 	if v := os.Getenv("JIRA_API_TOKEN"); v != "" {
 		*jiraToken = v
 	}
+	if v := os.Getenv("SCREENSHOT_LISTEN"); v != "" {
+		*screenshotListen = v
+	}
 
 	lis, err := openListener(*listen)
 	if err != nil {
@@ -267,6 +272,18 @@ func main() {
 		}()
 	}
 
+	var screenshotSrv *http.Server
+	if ghToken := os.Getenv("GH_TOKEN"); ghToken != "" {
+		handler := executor.NewScreenshotUploader(ghToken)
+		screenshotSrv = &http.Server{Addr: *screenshotListen, Handler: handler}
+		go func() {
+			log.Printf("screenshot-upload listening on %s", *screenshotListen)
+			if err := screenshotSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("screenshot upload: %v", err)
+			}
+		}()
+	}
+
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -280,6 +297,9 @@ func main() {
 		}
 		if jiraSrv != nil {
 			jiraSrv.Shutdown(ctx)
+		}
+		if screenshotSrv != nil {
+			screenshotSrv.Shutdown(ctx)
 		}
 	}()
 

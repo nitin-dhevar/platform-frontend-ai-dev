@@ -76,6 +76,7 @@ services:
         GOVERSIONS: "1.24.2 1.25.7"
     security_opt:
       - no-new-privileges
+    shm_size: 512m
     mem_limit: 8g
     cpus: 4
     pids_limit: 500
@@ -99,10 +100,10 @@ services:
       - ANTHROPIC_VERTEX_BASE_URL=http://proxy:8443
       - ANTHROPIC_VERTEX_PROJECT_ID=${ANTHROPIC_VERTEX_PROJECT_ID:-dummy-project}
       - CLOUD_ML_REGION=global
-      # Jira — proxied through proxy container
+      # Jira — proxied through proxy container (mcp-atlassian on port 8444)
       - JIRA_MCP_URL=http://proxy:8444/mcp
-      - JIRA_PROXY_URL=http://proxy:8445
-      - JIRA_PROXY_HEALTH_TIMEOUT=60
+      # GH release upload — proxied through proxy container (port 8446)
+      - GH_RELEASE_UPLOAD_URL=http://proxy:8446/upload
       # Route all HTTP/HTTPS through the Squid proxy
       - HTTP_PROXY=http://proxy:3128
       - HTTPS_PROXY=http://proxy:3128

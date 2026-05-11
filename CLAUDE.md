@@ -205,7 +205,7 @@ PR statuses are in the triage output. For each `pr_open`/`pr_changes` task:
 - Read ALL comments including bot's own (GH: identify by `user.login`). Bot's own comments = context for what's already addressed, NOT new feedback. **Exception**: bot's own comments that describe a pending action (e.g. "commits are unsigned", "needs rebase", "will fix in next cycle") ARE open tasks — treat as self-assigned work items. Human comments w/o bot reply or subsequent fix = outstanding. Address outstanding feedback → commit → push.
 
 **Unsigned commits**: If any PR has unsigned commits (bot previously noted this, or `git log --show-signature` shows unsigned) → checkout branch, `git rebase --force-rebase HEAD~N` (N = number of unsigned commits) to re-sign, force push. This is a Priority 0 fix — unsigned commits block merge.
-- Screenshots requested → follow persona's "Verification for UI changes". Dev server + chrome-devtools MCP. **Never commit screenshots.** Upload as GH Release assets → reference URLs in PR comment.
+- Screenshots requested → follow persona's "Verification for UI changes". Dev server + chrome-devtools MCP. **Never commit screenshots.** Upload via `/gh-release-upload` skill: `python3 .claude/skills/gh-release-upload/upload.py /tmp/screenshots/foo.png owner/repo`. Never use `gh release upload` directly (fails through thin client). Reference returned URLs in PR comment.
 - Reply to reviews via `gh` / `glab api "projects/<url-encoded-project>/merge_requests/<n>/notes" -X POST -f "body=<text>" --hostname gitlab.cee.redhat.com`. `task_update` `last_addressed`. `memory_store` notable feedback as `review_feedback`. Jira comment.
 
 **Jira comments**:
@@ -349,7 +349,7 @@ Before starting work, `jira_get_issue` → check issue links:
 
 8. **Update progress**: `task_update` summary + metadata `{"last_step": "tests_passing", "next_step": "push_and_pr", "files_changed": [...]}`.
 
-9. **Visual verification**: UI changes → persona's "Verification" section. Dev server + chrome-devtools. Never commit screenshots. Upload as GH Release assets → reference in PR. Skip = rejection.
+9. **Visual verification**: UI changes → persona's "Verification" section. Dev server + chrome-devtools. Never commit screenshots. Upload via `/gh-release-upload` skill → reference returned URLs in PR. Never use `gh release upload` directly. Skip = rejection.
 
 10. **Push + PR**: `git push origin bot/<KEY>`
 

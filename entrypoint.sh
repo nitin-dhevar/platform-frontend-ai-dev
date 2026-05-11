@@ -122,8 +122,8 @@ verify_platform_signing() {
 verify_platform_signing "GitHub" "https://github.com/test/repo.git" "${GH_USER_EMAIL}"
 verify_platform_signing "GitLab" "https://gitlab.cee.redhat.com/test/repo.git" "${GL_USER_EMAIL}"
 
-# Jira credentials are now in the proxy container (mcp-atlassian + auth proxy).
-# Python skills use JIRA_PROXY_URL env var instead of ~/.jira-credentials.
+# Jira credentials are in the proxy container (mcp-atlassian on port 8444).
+# Python skills use JIRA_MCP_URL env var to connect via MCP protocol.
 
 # Point MCP config to the memory server
 sed -i "s|http://localhost:8080/mcp|${BOT_MEMORY_URL}|" .mcp.json
@@ -177,10 +177,6 @@ if [ -n "${BOT_MEMORY_HEALTH_URL:-}" ]; then
     wait_for_http "memory-server" "$BOT_MEMORY_HEALTH_URL" "${BOT_MEMORY_HEALTH_TIMEOUT:-120}"
 fi
 
-# Jira auth proxy must be up before skills make REST calls
-if [ -n "${JIRA_PROXY_URL:-}" ]; then
-    wait_for_http "jira-proxy" "${JIRA_PROXY_URL}/healthz" "${JIRA_PROXY_HEALTH_TIMEOUT:-60}"
-fi
 
 # Start headless Chromium in background (Playwright-installed binary)
 CHROME_BIN=$(find "$PLAYWRIGHT_BROWSERS_PATH" -name chrome -type f | head -1)
