@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -23,62 +24,74 @@ def env_vars(temp_dir):
     """Set up environment variables for testing."""
     original_env = os.environ.copy()
 
-    os.environ["GITHUB_TOKEN"] = "test-github-token"
     os.environ["POST_PR_JIRA_URL"] = "https://test-jira.example.com"
-    os.environ["POST_PR_JIRA_TOKEN"] = "test-jira-token"
     os.environ["POST_PR_SLACK_WEBHOOK"] = "https://hooks.slack.com/test"
     os.environ["POST_PR_MEMORY_STORE"] = str(temp_dir / "memory.json")
 
     yield
 
-    # Restore original environment
     os.environ.clear()
     os.environ.update(original_env)
 
 
+def _make_gh_side_effect():
+    """Create a subprocess.run side_effect for gh CLI calls."""
+    def side_effect(args, **kwargs):
+        result = Mock(spec=subprocess.CompletedProcess)
+        result.returncode = 0
+        result.stderr = ""
+        args_str = " ".join(args) if isinstance(args, list) else args
+
+        if "labels" in args_str and "POST" in args_str:
+            result.stdout = json.dumps([{"name": "code-review"}, {"name": "awaiting-review"}])
+        elif "pulls/" in args_str and "PATCH" not in args_str and "requested_reviewers" not in args_str:
+            result.stdout = json.dumps({"body": "Existing PR description"})
+        elif "PATCH" in args_str:
+            result.stdout = json.dumps({"body": "Updated"})
+        elif "requested_reviewers" in args_str:
+            result.stdout = json.dumps({"requested_reviewers": [{"login": "user1"}]})
+        else:
+            result.stdout = "{}"
+        return result
+    return side_effect
+
+
 @pytest.fixture
-def mock_github_api():
-    """Mock GitHub and JIRA API responses."""
-    with patch("scripts.post_pr_operations.httpx.Client") as mock_client_class:
+def mock_apis():
+    """Mock gh CLI (subprocess) and Jira MCP calls."""
+    with patch("scripts.post_pr_operations.subprocess.run") as mock_run, \
+         patch("scripts.post_pr_operations.jira_call") as mock_jira_call, \
+         patch("scripts.post_pr_operations.httpx.Client") as mock_client_class:
+        mock_run.side_effect = _make_gh_side_effect()
+
+        mock_jira_call.side_effect = [
+            {"transitions": [{"id": "21", "to": {"name": "Code Review"}}]},
+            {"success": True},
+            {"id": "12345"},
+        ]
+
         mock_client = Mock()
         mock_client_class.return_value.__enter__.return_value = mock_client
-
-        # Mock GitHub responses
         mock_post_response = Mock()
         mock_post_response.raise_for_status = Mock()
-
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-
-        # Will be called for both GitHub PR GET and JIRA transitions GET
-        def get_side_effect(url, **kwargs):
-            response = Mock()
-            response.raise_for_status = Mock()
-            if "github.com" in url:
-                response.json.return_value = {"body": "Existing PR description"}
-            elif "transitions" in url:
-                # JIRA transitions response
-                response.json.return_value = {
-                    "transitions": [
-                        {"id": "21", "to": {"name": "Code Review"}},
-                    ]
-                }
-            return response
-
-        mock_patch_response = Mock()
-        mock_patch_response.raise_for_status = Mock()
-
         mock_client.post.return_value = mock_post_response
-        mock_client.get.side_effect = get_side_effect
-        mock_client.patch.return_value = mock_patch_response
 
-        yield mock_client
+        yield mock_run, mock_jira_call
+
+
+def _reset_jira_mock(mock_jira_call):
+    """Reset jira_call mock with fresh side_effect for a new workflow run."""
+    mock_jira_call.side_effect = [
+        {"transitions": [{"id": "21", "to": {"name": "Code Review"}}]},
+        {"success": True},
+        {"id": "12345"},
+    ]
 
 
 class TestFullWorkflow:
     """Test complete post-PR workflow."""
 
-    def test_successful_workflow(self, env_vars, temp_dir, mock_github_api):
+    def test_successful_workflow(self, env_vars, temp_dir, mock_apis):
         """Test successful execution of all operations."""
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/123",
@@ -95,11 +108,9 @@ class TestFullWorkflow:
         assert result.ticket_id == "TICKET-456"
         assert len(result.operations) == 6
 
-        # Verify all operations succeeded
         for op in result.operations:
             assert op.status == OperationStatus.SUCCESS
 
-        # Verify operation order
         expected_operations = [
             "task_update",
             "jira_transition_issue",
@@ -111,7 +122,7 @@ class TestFullWorkflow:
         actual_operations = [op.operation for op in result.operations]
         assert actual_operations == expected_operations
 
-    def test_workflow_with_skip_operations(self, env_vars, mock_github_api):
+    def test_workflow_with_skip_operations(self, env_vars, mock_apis):
         """Test workflow with some operations skipped."""
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/124",
@@ -123,19 +134,17 @@ class TestFullWorkflow:
 
         assert result.success is True
 
-        # Verify skipped operations
         slack_op = next(op for op in result.operations if op.operation == "slack_notify")
         assert slack_op.status == OperationStatus.SKIPPED
 
         memory_op = next(op for op in result.operations if op.operation == "memory_store")
         assert memory_op.status == OperationStatus.SKIPPED
 
-        # Verify non-skipped operations succeeded
         for op in result.operations:
             if op.operation not in ["slack_notify", "memory_store"]:
                 assert op.status == OperationStatus.SUCCESS
 
-    def test_workflow_dry_run(self, env_vars, temp_dir, mock_github_api):
+    def test_workflow_dry_run(self, env_vars, temp_dir, mock_apis):
         """Test workflow in dry-run mode."""
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/125",
@@ -147,43 +156,38 @@ class TestFullWorkflow:
 
         assert result.success is True
 
-        # Verify all operations succeeded (dry-run should not fail)
         for op in result.operations:
             assert op.status == OperationStatus.SUCCESS
 
-        # Verify no files were created (memory store shouldn't exist in dry-run)
         memory_store = Path(os.environ["POST_PR_MEMORY_STORE"])
         assert not memory_store.exists()
 
     def test_workflow_fails_fast_on_error(self, temp_dir, monkeypatch):
         """Test that workflow stops on first error (fail-fast)."""
-        # Clear all token environment variables
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-        monkeypatch.delenv("POST_PR_JIRA_TOKEN", raising=False)
         monkeypatch.delenv("POST_PR_SLACK_WEBHOOK", raising=False)
-
-        # Set up minimal environment
         monkeypatch.setenv("POST_PR_MEMORY_STORE", str(temp_dir / "memory.json"))
 
-        result = execute_post_pr_workflow(
-            pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/126",
-            pr_number=126,
-            ticket_id="TICKET-459",
-            summary="Test failure",
-        )
+        with patch("scripts.post_pr_operations.subprocess.run") as mock_run:
+            mock_run.side_effect = lambda args, **kwargs: Mock(
+                returncode=1, stdout="", stderr="gh: command not found"
+            )
+
+            result = execute_post_pr_workflow(
+                pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/126",
+                pr_number=126,
+                ticket_id="TICKET-459",
+                summary="Test failure",
+            )
 
         assert result.success is False
 
-        # Find the failed operation (should be first one - task_update)
         failed_ops = [op for op in result.operations if op.status == OperationStatus.FAILED]
         assert len(failed_ops) > 0
         assert failed_ops[0].operation == "task_update"
 
-        # Verify workflow stopped after failure (only 1 operation ran)
         assert len(result.operations) == 1
 
-    def test_workflow_result_serialization(self, env_vars, mock_github_api):
+    def test_workflow_result_serialization(self, env_vars, mock_apis):
         """Test that workflow result can be serialized to JSON."""
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/127",
@@ -192,11 +196,9 @@ class TestFullWorkflow:
             summary="Test serialization",
         )
 
-        # Convert to dict and serialize
         result_dict = result.to_dict()
         json_str = json.dumps(result_dict, indent=2)
 
-        # Verify JSON is valid and can be parsed
         parsed = json.loads(json_str)
         assert parsed["success"] is True
         assert parsed["pr_number"] == 127
@@ -207,7 +209,7 @@ class TestFullWorkflow:
 class TestWorkflowEdgeCases:
     """Test edge cases and error scenarios."""
 
-    def test_workflow_with_minimal_inputs(self, env_vars, mock_github_api):
+    def test_workflow_with_minimal_inputs(self, env_vars, mock_apis):
         """Test workflow with only required inputs."""
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/128",
@@ -217,13 +219,15 @@ class TestWorkflowEdgeCases:
         )
 
         assert result.success is True
-        # Should use default Slack channel
         slack_op = next(op for op in result.operations if op.operation == "slack_notify")
         assert slack_op.details["channel"] == "#hcc-ai-assistant"
 
-    def test_workflow_with_long_summary(self, env_vars, mock_github_api):
+    def test_workflow_with_long_summary(self, env_vars, mock_apis):
         """Test workflow with very long PR summary."""
-        long_summary = "A" * 1000  # 1000 character summary
+        _, mock_jira_call = mock_apis
+        _reset_jira_mock(mock_jira_call)
+
+        long_summary = "A" * 1000
 
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/129",
@@ -234,12 +238,14 @@ class TestWorkflowEdgeCases:
 
         assert result.success is True
 
-        # Verify summary is preserved in operations
         jira_comment_op = next(op for op in result.operations if op.operation == "jira_add_comment")
         assert long_summary in jira_comment_op.details["comment"]
 
-    def test_workflow_with_special_characters(self, env_vars, mock_github_api):
+    def test_workflow_with_special_characters(self, env_vars, mock_apis):
         """Test workflow with special characters in summary."""
+        _, mock_jira_call = mock_apis
+        _reset_jira_mock(mock_jira_call)
+
         special_summary = 'Test "quotes" & <tags> and \\backslashes\\'
 
         result = execute_post_pr_workflow(
@@ -251,13 +257,15 @@ class TestWorkflowEdgeCases:
 
         assert result.success is True
 
-        # Verify PR was updated successfully
         task_op = next(op for op in result.operations if op.operation == "task_update")
         assert task_op.status == OperationStatus.SUCCESS
         assert task_op.details["jira_ticket"] == "TICKET-463"
 
-    def test_workflow_with_reviewers(self, env_vars, mock_github_api):
+    def test_workflow_with_reviewers(self, env_vars, mock_apis):
         """Test workflow with reviewers specified."""
+        _, mock_jira_call = mock_apis
+        _reset_jira_mock(mock_jira_call)
+
         result = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/131",
             pr_number=131,
@@ -275,8 +283,10 @@ class TestWorkflowEdgeCases:
 class TestWorkflowPersistence:
     """Test that workflow operations persist data correctly."""
 
-    def test_github_pr_updates(self, env_vars, mock_github_api):
+    def test_github_pr_updates(self, env_vars, mock_apis):
         """Test that GitHub PR updates include correct details."""
+        _, mock_jira_call = mock_apis
+
         result1 = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/132",
             pr_number=132,
@@ -284,6 +294,8 @@ class TestWorkflowPersistence:
             summary="First PR",
             reviewers=["user1"],
         )
+
+        _reset_jira_mock(mock_jira_call)
 
         result2 = execute_post_pr_workflow(
             pr_url="https://github.com/test/other-repo/pull/133",
@@ -296,24 +308,24 @@ class TestWorkflowPersistence:
         assert result1.success is True
         assert result2.success is True
 
-        # Verify first PR update
         task_op1 = next(op for op in result1.operations if op.operation == "task_update")
         assert task_op1.details["owner"] == "RedHatInsights"
         assert task_op1.details["repo"] == "hcc-ai-assistant"
         assert task_op1.details["pr_number"] == 132
         assert task_op1.details["reviewers_requested"] == ["user1"]
 
-        # Verify second PR update
         task_op2 = next(op for op in result2.operations if op.operation == "task_update")
         assert task_op2.details["owner"] == "test"
         assert task_op2.details["repo"] == "other-repo"
         assert task_op2.details["pr_number"] == 133
         assert task_op2.details["reviewers_requested"] == ["user2", "user3"]
 
-    def test_memory_accumulation(self, env_vars, temp_dir, mock_github_api):
+    def test_memory_accumulation(self, env_vars, temp_dir, mock_apis):
         """Test that memories accumulate over multiple executions."""
-        # Execute workflow 3 times
+        _, mock_jira_call = mock_apis
+
         for i in range(3):
+            _reset_jira_mock(mock_jira_call)
             result = execute_post_pr_workflow(
                 pr_url=f"https://github.com/RedHatInsights/hcc-ai-assistant/pull/{134 + i}",
                 pr_number=134 + i,
@@ -322,7 +334,6 @@ class TestWorkflowPersistence:
             )
             assert result.success is True
 
-        # Verify all memories are stored
         memory_store = Path(os.environ["POST_PR_MEMORY_STORE"])
         assert memory_store.exists()
 
@@ -334,14 +345,18 @@ class TestWorkflowPersistence:
                 assert memory["ticket_id"] == f"TICKET-{467 + i}"
                 assert memory["pr_url"] == f"https://github.com/RedHatInsights/hcc-ai-assistant/pull/{134 + i}"
 
-    def test_bot_status_overwrite(self, env_vars, mock_github_api):
+    def test_bot_status_overwrite(self, env_vars, mock_apis):
         """Test that bot status is overwritten on each execution."""
+        _, mock_jira_call = mock_apis
+
         result1 = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/137",
             pr_number=137,
             ticket_id="TICKET-470",
             summary="First",
         )
+
+        _reset_jira_mock(mock_jira_call)
 
         result2 = execute_post_pr_workflow(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/138",
@@ -353,12 +368,10 @@ class TestWorkflowPersistence:
         assert result1.success is True
         assert result2.success is True
 
-        # Verify status file contains latest status
         status_file = Path("/tmp/bot_status.json")
         assert status_file.exists()
 
         with open(status_file, "r") as f:
             status = json.load(f)
             assert status["status"] == "idle"
-            # Should be recent timestamp from second execution
             assert status["timestamp"]

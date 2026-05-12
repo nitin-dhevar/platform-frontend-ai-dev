@@ -14,11 +14,12 @@ Fully integrated with GitHub REST API, JIRA Cloud API v3, and Slack webhooks.
 """
 
 import argparse
-import base64
 import json
 import logging
 import os
+import subprocess
 import sys
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -26,6 +27,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+from jira_mcp import jira_call
 
 logging.basicConfig(level=logging.INFO, format="[post-pr] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -87,167 +91,264 @@ class PostPROperations:
 
     def __init__(
         self,
-        github_token: str,
-        jira_url: str,
-        jira_token: str,
-        jira_email: str,
         slack_webhook: str,
         memory_store_path: str,
+        jira_url: str = "https://redhat.atlassian.net",
         dry_run: bool = False,
     ):
-        """Initialize with configuration.
-
-        Args:
-            github_token: GitHub API token
-            jira_url: JIRA instance URL (e.g., https://redhat.atlassian.net)
-            jira_token: JIRA API token
-            jira_email: Email for JIRA Basic auth
-            slack_webhook: Slack webhook URL
-            memory_store_path: Path to memory storage file
-            dry_run: If True, log actions without executing
-        """
-        self.github_token = github_token
         self.jira_url = jira_url
-        self.jira_token = jira_token
-        self.jira_email = jira_email
         self.slack_webhook = slack_webhook
         self.memory_store_path = Path(memory_store_path)
         self.dry_run = dry_run
-
-        # Ensure directories exist
         self.memory_store_path.parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _run_cli(args: List[str], input_data: Optional[str] = None) -> tuple:
+        """Run a CLI command and return (success, output)."""
+        try:
+            r = subprocess.run(args, input=input_data, capture_output=True, text=True, timeout=30)
+            output = r.stdout.strip() or r.stderr.strip()
+            if r.returncode != 0:
+                return False, output
+            return True, output
+        except Exception as e:
+            return False, str(e)
+
+    def _parse_pr_url(self, pr_url: str) -> Dict[str, str]:
+        """Parse a PR/MR URL into components."""
+        parsed = urllib.parse.urlparse(pr_url)
+        hostname = parsed.hostname or ""
+
+        if "github.com" in hostname:
+            parts = pr_url.rstrip("/").split("/")
+            if len(parts) < 5:
+                raise ValueError(f"Invalid GitHub PR URL: {pr_url}")
+            return {"host": "github", "owner": parts[-4], "repo": parts[-3]}
+
+        if "gitlab" in hostname:
+            path_parts = parsed.path.split("/-/merge_requests/")
+            if len(path_parts) != 2:
+                raise ValueError(f"Invalid GitLab MR URL: {pr_url}")
+            project_path = path_parts[0].strip("/")
+            segments = project_path.rsplit("/", 1)
+            owner = segments[0] if len(segments) > 1 else ""
+            repo = segments[-1]
+            return {
+                "host": "gitlab",
+                "hostname": hostname,
+                "owner": owner,
+                "repo": repo,
+                "project_path": project_path,
+            }
+
+        raise ValueError(f"Unsupported PR URL (not GitHub or GitLab): {pr_url}")
 
     def task_update(
         self, pr_url: str, pr_number: int, ticket_id: str, reviewers: Optional[List[str]] = None
     ) -> OperationResult:
-        """Update GitHub PR with labels, JIRA link in description, and request reviewers.
+        """Update PR/MR with labels, JIRA link in description, and request reviewers.
 
-        Args:
-            pr_url: GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)
-            pr_number: PR number
-            ticket_id: JIRA ticket ID to link in PR description
-            reviewers: List of GitHub usernames to request as reviewers
-
-        Returns:
-            OperationResult with success/failure status
+        Supports both GitHub (via gh CLI) and GitLab (via glab CLI).
         """
         try:
-            if not self.github_token:
-                raise ValueError(
-                    "GitHub token not configured (set GITHUB_TOKEN env var or pass github_token parameter)"
-                )
-
-            # Parse owner and repo from PR URL
-            # Example: https://github.com/RedHatInsights/hcc-ai-assistant/pull/123
-            parts = pr_url.rstrip("/").split("/")
-            if len(parts) < 5 or "github.com" not in pr_url:
-                raise ValueError(f"Invalid GitHub PR URL: {pr_url}")
-
-            owner = parts[-4]
-            repo = parts[-3]
-
-            # Default reviewers if none provided
+            info = self._parse_pr_url(pr_url)
             if reviewers is None:
                 reviewers = []
 
-            updates = []
-            headers = {
-                "Authorization": f"token {self.github_token}",
-                "Accept": "application/vnd.github.v3+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
-
-            # 1. Add labels
-            labels_to_add = ["code-review", "awaiting-review"]
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Would add labels to PR #{pr_number}: {labels_to_add}")
+            if info["host"] == "github":
+                return self._update_github_pr(info, pr_url, pr_number, ticket_id, reviewers)
             else:
-                with httpx.Client() as client:
-                    response = client.post(
-                        f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/labels",
-                        headers=headers,
-                        json={"labels": labels_to_add},
-                        timeout=30.0,
-                    )
-                    response.raise_for_status()
-                    logger.info(f"Added labels to PR #{pr_number}: {labels_to_add}")
-            updates.append(f"Added labels: {', '.join(labels_to_add)}")
-
-            # 2. Update PR description with JIRA link
-            jira_link = f"{self.jira_url}/browse/{ticket_id}"
-            jira_section = f"\n\n---\n**JIRA Ticket**: [{ticket_id}]({jira_link})"
-
-            if self.dry_run:
-                logger.info(f"[DRY RUN] Would update PR description with JIRA link: {jira_link}")
-            else:
-                with httpx.Client() as client:
-                    # First, get current PR description
-                    get_response = client.get(
-                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-                        headers=headers,
-                        timeout=30.0,
-                    )
-                    get_response.raise_for_status()
-                    pr_data = get_response.json()
-                    current_body = pr_data.get("body") or ""
-
-                    # Check if JIRA link already exists
-                    if ticket_id not in current_body:
-                        updated_body = current_body + jira_section
-
-                        # Update PR description
-                        patch_response = client.patch(
-                            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
-                            headers=headers,
-                            json={"body": updated_body},
-                            timeout=30.0,
-                        )
-                        patch_response.raise_for_status()
-                        logger.info(f"Updated PR description with JIRA link: {jira_link}")
-                    else:
-                        logger.info("JIRA link already exists in PR description")
-            updates.append("Added JIRA link to description")
-
-            # 3. Request reviewers
-            if reviewers:
-                if self.dry_run:
-                    logger.info(f"[DRY RUN] Would request reviewers for PR #{pr_number}: {reviewers}")
-                else:
-                    with httpx.Client() as client:
-                        response = client.post(
-                            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers",
-                            headers=headers,
-                            json={"reviewers": reviewers},
-                            timeout=30.0,
-                        )
-                        response.raise_for_status()
-                        logger.info(f"Requested reviewers for PR #{pr_number}: {reviewers}")
-                updates.append(f"Requested reviewers: {', '.join(reviewers)}")
-
-            return OperationResult(
-                operation="task_update",
-                status=OperationStatus.SUCCESS,
-                message=f"Updated PR #{pr_number}: {'; '.join(updates)}",
-                details={
-                    "pr_url": pr_url,
-                    "pr_number": pr_number,
-                    "owner": owner,
-                    "repo": repo,
-                    "labels_added": labels_to_add,
-                    "jira_ticket": ticket_id,
-                    "jira_link": jira_link,
-                    "reviewers_requested": reviewers,
-                },
-            )
+                return self._update_gitlab_mr(info, pr_url, pr_number, ticket_id, reviewers)
 
         except Exception as e:
-            logger.error(f"Failed to update GitHub PR: {e}")
+            logger.error(f"Failed to update PR/MR: {e}")
             return OperationResult(
-                operation="task_update", status=OperationStatus.FAILED, message=f"GitHub PR update failed: {e}"
+                operation="task_update", status=OperationStatus.FAILED, message=f"PR/MR update failed: {e}"
             )
 
+    def _update_github_pr(
+        self, info: Dict[str, str], pr_url: str, pr_number: int, ticket_id: str, reviewers: List[str]
+    ) -> OperationResult:
+        """Update GitHub PR via gh CLI."""
+        owner = info["owner"]
+        repo = info["repo"]
+        updates = []
+        labels_to_add = ["code-review", "awaiting-review"]
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would update GitHub PR #{pr_number} on {owner}/{repo}")
+        else:
+            ok, out = self._run_cli(
+                ["gh", "api", f"repos/{owner}/{repo}/issues/{pr_number}/labels", "-X", "POST", "--input", "-"],
+                input_data=json.dumps({"labels": labels_to_add}),
+            )
+            if not ok:
+                raise ValueError(f"Failed to add labels: {out}")
+            logger.info(f"Added labels to PR #{pr_number}: {labels_to_add}")
+        updates.append(f"Added labels: {', '.join(labels_to_add)}")
+
+        jira_link = f"{self.jira_url}/browse/{ticket_id}"
+        jira_section = f"\n\n---\n**JIRA Ticket**: [{ticket_id}]({jira_link})"
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would update PR description with JIRA link: {jira_link}")
+        else:
+            ok, out = self._run_cli(["gh", "api", f"repos/{owner}/{repo}/pulls/{pr_number}"])
+            if not ok:
+                raise ValueError(f"Failed to get PR: {out}")
+            pr_data = json.loads(out)
+            current_body = pr_data.get("body") or ""
+
+            if ticket_id not in current_body:
+                updated_body = current_body + jira_section
+                ok, out = self._run_cli(
+                    ["gh", "api", f"repos/{owner}/{repo}/pulls/{pr_number}", "-X", "PATCH", "--input", "-"],
+                    input_data=json.dumps({"body": updated_body}),
+                )
+                if not ok:
+                    raise ValueError(f"Failed to update PR description: {out}")
+                logger.info(f"Updated PR description with JIRA link: {jira_link}")
+            else:
+                logger.info("JIRA link already exists in PR description")
+        updates.append("Added JIRA link to description")
+
+        if reviewers:
+            if self.dry_run:
+                logger.info(f"[DRY RUN] Would request reviewers for PR #{pr_number}: {reviewers}")
+            else:
+                ok, out = self._run_cli(
+                    [
+                        "gh", "api",
+                        f"repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers",
+                        "-X", "POST", "--input", "-",
+                    ],
+                    input_data=json.dumps({"reviewers": reviewers}),
+                )
+                if not ok:
+                    raise ValueError(f"Failed to request reviewers: {out}")
+                logger.info(f"Requested reviewers for PR #{pr_number}: {reviewers}")
+            updates.append(f"Requested reviewers: {', '.join(reviewers)}")
+
+        return OperationResult(
+            operation="task_update",
+            status=OperationStatus.SUCCESS,
+            message=f"Updated PR #{pr_number}: {'; '.join(updates)}",
+            details={
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "owner": owner,
+                "repo": repo,
+                "labels_added": labels_to_add,
+                "jira_ticket": ticket_id,
+                "jira_link": jira_link,
+                "reviewers_requested": reviewers,
+            },
+        )
+
+    def _update_gitlab_mr(
+        self, info: Dict[str, str], pr_url: str, pr_number: int, ticket_id: str, reviewers: List[str]
+    ) -> OperationResult:
+        """Update GitLab MR via glab CLI."""
+        hostname = info["hostname"]
+        project_path = info["project_path"]
+        encoded_project = urllib.parse.quote(project_path, safe="")
+        owner = info["owner"]
+        repo = info["repo"]
+        updates = []
+        labels_to_add = ["code-review", "awaiting-review"]
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would update GitLab MR !{pr_number} on {project_path}")
+        else:
+            ok, out = self._run_cli([
+                "glab", "api", f"projects/{encoded_project}/merge_requests/{pr_number}",
+                "-X", "PUT", "-f", f"add_labels={','.join(labels_to_add)}",
+                "--hostname", hostname,
+            ])
+            if not ok:
+                raise ValueError(f"Failed to add labels: {out}")
+            logger.info(f"Added labels to MR !{pr_number}: {labels_to_add}")
+        updates.append(f"Added labels: {', '.join(labels_to_add)}")
+
+        jira_link = f"{self.jira_url}/browse/{ticket_id}"
+        jira_section = f"\n\n---\n**JIRA Ticket**: [{ticket_id}]({jira_link})"
+
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would update MR description with JIRA link: {jira_link}")
+        else:
+            ok, out = self._run_cli([
+                "glab", "api", f"projects/{encoded_project}/merge_requests/{pr_number}",
+                "--hostname", hostname,
+            ])
+            if not ok:
+                raise ValueError(f"Failed to get MR: {out}")
+            mr_data = json.loads(out)
+            current_body = mr_data.get("description") or ""
+
+            if ticket_id not in current_body:
+                updated_body = current_body + jira_section
+                ok, out = self._run_cli(
+                    [
+                        "glab", "api", f"projects/{encoded_project}/merge_requests/{pr_number}",
+                        "-X", "PUT", "--input", "-",
+                        "--hostname", hostname,
+                    ],
+                    input_data=json.dumps({"description": updated_body}),
+                )
+                if not ok:
+                    raise ValueError(f"Failed to update MR description: {out}")
+                logger.info(f"Updated MR description with JIRA link: {jira_link}")
+            else:
+                logger.info("JIRA link already exists in MR description")
+        updates.append("Added JIRA link to description")
+
+        if reviewers:
+            if self.dry_run:
+                logger.info(f"[DRY RUN] Would request reviewers for MR !{pr_number}: {reviewers}")
+            else:
+                reviewer_ids = []
+                for reviewer in reviewers:
+                    ok, out = self._run_cli([
+                        "glab", "api", f"users?username={reviewer}",
+                        "--hostname", hostname,
+                    ])
+                    if ok:
+                        users = json.loads(out)
+                        if users:
+                            reviewer_ids.append(users[0]["id"])
+
+                if reviewer_ids:
+                    ok, out = self._run_cli(
+                        [
+                            "glab", "api", f"projects/{encoded_project}/merge_requests/{pr_number}",
+                            "-X", "PUT", "--input", "-",
+                            "--hostname", hostname,
+                        ],
+                        input_data=json.dumps({"reviewer_ids": reviewer_ids}),
+                    )
+                    if not ok:
+                        raise ValueError(f"Failed to request reviewers: {out}")
+                    logger.info(f"Requested reviewers for MR !{pr_number}: {reviewers}")
+            updates.append(f"Requested reviewers: {', '.join(reviewers)}")
+
+        return OperationResult(
+            operation="task_update",
+            status=OperationStatus.SUCCESS,
+            message=f"Updated MR !{pr_number}: {'; '.join(updates)}",
+            details={
+                "pr_url": pr_url,
+                "pr_number": pr_number,
+                "owner": owner,
+                "repo": repo,
+                "labels_added": labels_to_add,
+                "jira_ticket": ticket_id,
+                "jira_link": jira_link,
+                "reviewers_requested": reviewers,
+            },
+        )
+
     def jira_transition_issue(self, ticket_id: str, target_status: str = "Code Review") -> OperationResult:
-        """Transition JIRA issue to target status.
+        """Transition JIRA issue to target status via MCP.
 
         Args:
             ticket_id: JIRA ticket ID (e.g., TICKET-456)
@@ -257,61 +358,42 @@ class PostPROperations:
             OperationResult with success/failure status
         """
         try:
-            if not self.jira_token:
-                raise ValueError("JIRA token not configured (set POST_PR_JIRA_TOKEN)")
-
-            # Use Basic auth for JIRA Cloud (email:token)
-            auth_string = f"{self.jira_email}:{self.jira_token}"
-            basic_auth = base64.b64encode(auth_string.encode()).decode()
-            headers = {
-                "Authorization": f"Basic {basic_auth}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-
             if self.dry_run:
                 logger.info(f"[DRY RUN] Would transition {ticket_id} to {target_status}")
             else:
-                with httpx.Client(follow_redirects=True) as client:
-                    # Get available transitions using API v3 (required for JIRA Cloud)
-                    get_response = client.get(
-                        f"{self.jira_url}/rest/api/3/issue/{ticket_id}/transitions",
-                        headers=headers,
-                        timeout=30.0,
-                    )
-                    get_response.raise_for_status()
-                    response_data = get_response.json()
-                    transitions = response_data.get("transitions", [])
+                data = jira_call("jira_get_transitions", {"issue_key": ticket_id})
+                if not data:
+                    raise ValueError("Failed to get transitions from Jira MCP")
 
-                    # Find the transition ID for the target status
-                    transition_id = None
+                transitions = data if isinstance(data, list) else data.get("transitions", [])
+
+                transition_id = None
+                for transition in transitions:
+                    name = transition.get("to", transition).get("name", "")
+                    if name == target_status:
+                        transition_id = transition.get("id")
+                        break
+
+                if not transition_id:
                     for transition in transitions:
-                        if transition.get("to", {}).get("name") == target_status:
+                        name = transition.get("to", transition).get("name", "")
+                        if name.lower() == target_status.lower():
                             transition_id = transition.get("id")
                             break
 
-                    if not transition_id:
-                        # If exact match not found, try case-insensitive match
-                        for transition in transitions:
-                            if transition.get("to", {}).get("name", "").lower() == target_status.lower():
-                                transition_id = transition.get("id")
-                                break
-
-                    if not transition_id:
-                        available = [t.get("to", {}).get("name") for t in transitions]
-                        raise ValueError(
-                            f"Cannot transition to '{target_status}'. Available transitions: {', '.join(available)}"
-                        )
-
-                    # Execute the transition using API v3
-                    post_response = client.post(
-                        f"{self.jira_url}/rest/api/3/issue/{ticket_id}/transitions",
-                        headers=headers,
-                        json={"transition": {"id": transition_id}},
-                        timeout=30.0,
+                if not transition_id:
+                    available = [t.get("to", t).get("name", "") for t in transitions]
+                    raise ValueError(
+                        f"Cannot transition to '{target_status}'. Available transitions: {', '.join(available)}"
                     )
-                    post_response.raise_for_status()
-                    logger.info(f"Transitioned {ticket_id} to {target_status}")
+
+                result = jira_call("jira_transition_issue", {
+                    "issue_key": ticket_id,
+                    "transition_id": str(transition_id),
+                })
+                if result is None:
+                    raise ValueError("Transition call returned None")
+                logger.info(f"Transitioned {ticket_id} to {target_status}")
 
             return OperationResult(
                 operation="jira_transition_issue",
@@ -331,7 +413,7 @@ class PostPROperations:
             )
 
     def jira_add_comment(self, ticket_id: str, pr_url: str, summary: str) -> OperationResult:
-        """Add comment to JIRA issue with PR link and summary.
+        """Add comment to JIRA issue with PR link and summary via MCP.
 
         Args:
             ticket_id: JIRA ticket ID
@@ -342,43 +424,18 @@ class PostPROperations:
             OperationResult with success/failure status
         """
         try:
-            if not self.jira_token:
-                raise ValueError("JIRA token not configured (set POST_PR_JIRA_TOKEN)")
-
-            # API v3 uses Atlassian Document Format (ADF) for comments
             comment_text = f"Pull Request created: {pr_url}\n\nSummary: {summary}"
-            comment_adf = {
-                "body": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [
-                        {"type": "paragraph", "content": [{"type": "text", "text": f"Pull Request created: {pr_url}"}]},
-                        {"type": "paragraph", "content": [{"type": "text", "text": f"Summary: {summary}"}]},
-                    ],
-                }
-            }
-
-            # Use Basic auth for JIRA Cloud (email:token)
-            auth_string = f"{self.jira_email}:{self.jira_token}"
-            basic_auth = base64.b64encode(auth_string.encode()).decode()
-            headers = {
-                "Authorization": f"Basic {basic_auth}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
 
             if self.dry_run:
                 logger.info(f"[DRY RUN] Would add comment to {ticket_id}: {comment_text}")
             else:
-                with httpx.Client(follow_redirects=True) as client:
-                    response = client.post(
-                        f"{self.jira_url}/rest/api/3/issue/{ticket_id}/comment",
-                        headers=headers,
-                        json=comment_adf,
-                        timeout=30.0,
-                    )
-                    response.raise_for_status()
-                    logger.info(f"Added comment to {ticket_id}")
+                result = jira_call("jira_add_comment", {
+                    "issue_key": ticket_id,
+                    "body": comment_text,
+                })
+                if result is None:
+                    raise ValueError("Failed to add comment via Jira MCP")
+                logger.info(f"Added comment to {ticket_id}")
 
             return OperationResult(
                 operation="jira_add_comment",
@@ -535,10 +592,7 @@ def execute_post_pr_workflow(
     pr_number: int,
     ticket_id: str,
     summary: str,
-    github_token: Optional[str] = None,
     jira_url: Optional[str] = None,
-    jira_token: Optional[str] = None,
-    jira_email: Optional[str] = None,
     slack_webhook: Optional[str] = None,
     slack_channel: str = "#hcc-ai-assistant",
     memory_store_path: Optional[str] = None,
@@ -548,41 +602,18 @@ def execute_post_pr_workflow(
 ) -> WorkflowResult:
     """Execute the complete post-PR workflow.
 
-    Args:
-        pr_url: GitHub PR URL
-        pr_number: PR number
-        ticket_id: JIRA ticket ID
-        summary: PR summary
-        github_token: GitHub API token (optional, defaults to env var)
-        jira_url: JIRA instance URL (optional, defaults to env var)
-        jira_token: JIRA API token (optional, defaults to env var)
-        jira_email: JIRA user email (optional, defaults to env var)
-        slack_webhook: Slack webhook URL (optional, defaults to env var)
-        slack_channel: Slack channel for notifications
-        memory_store_path: Path to memory storage file (optional, defaults to env var)
-        reviewers: List of GitHub usernames to request as reviewers
-        skip_operations: List of operations to skip
-        dry_run: Show what would be done without executing
-
-    Returns:
-        WorkflowResult with status and operation results
+    GitHub/GitLab operations use gh/glab CLI (no tokens needed).
+    JIRA operations use MCP via jira_call.
     """
-    # Resolve configuration from environment variables
-    github_token = github_token or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
     jira_url = jira_url or os.getenv("POST_PR_JIRA_URL", "https://redhat.atlassian.net")
-    jira_token = jira_token or os.getenv("POST_PR_JIRA_TOKEN")
-    jira_email = jira_email or os.getenv("POST_PR_JIRA_EMAIL", "")
     slack_webhook = slack_webhook or os.getenv("POST_PR_SLACK_WEBHOOK")
     memory_store_path = memory_store_path or os.getenv("POST_PR_MEMORY_STORE", "/tmp/memory.json")
 
     skip_operations = skip_operations or []
     operations = PostPROperations(
-        github_token=github_token,
-        jira_url=jira_url,
-        jira_token=jira_token,
-        jira_email=jira_email,
         slack_webhook=slack_webhook,
         memory_store_path=memory_store_path,
+        jira_url=jira_url,
         dry_run=dry_run,
     )
 
@@ -683,8 +714,6 @@ def main():
     parser.add_argument("pr_number", type=int, help="PR number")
     parser.add_argument("ticket_id", help="JIRA ticket ID")
     parser.add_argument("summary", help="PR summary")
-    parser.add_argument("--github-token", help="GitHub API token (falls back to GITHUB_TOKEN env var)")
-    parser.add_argument("--jira-token", help="JIRA API token (falls back to POST_PR_JIRA_TOKEN env var)")
     parser.add_argument("--slack-channel", default="#hcc-ai-assistant", help="Slack channel for notifications")
     parser.add_argument("--reviewers", help="Comma-separated list of GitHub usernames to request as reviewers")
     parser.add_argument(
@@ -703,8 +732,6 @@ def main():
         pr_number=args.pr_number,
         ticket_id=args.ticket_id,
         summary=args.summary,
-        github_token=args.github_token,
-        jira_token=args.jira_token,
         slack_channel=args.slack_channel,
         reviewers=reviewers,
         skip_operations=skip_operations,

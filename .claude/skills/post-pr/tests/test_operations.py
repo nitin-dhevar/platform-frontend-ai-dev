@@ -1,6 +1,7 @@
 """Unit tests for post-PR operations."""
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -26,40 +27,48 @@ def temp_dir():
 def operations(temp_dir):
     """Create PostPROperations instance with temp file paths."""
     return PostPROperations(
-        github_token="test-github-token",
-        jira_url="https://test-jira.example.com",
-        jira_token="test-jira-token",
-        jira_email="test@example.com",
         slack_webhook="https://hooks.slack.com/test",
         memory_store_path=str(temp_dir / "memory.json"),
+        jira_url="https://test-jira.example.com",
         dry_run=False,
     )
 
 
+def _mock_subprocess_run(responses):
+    """Create a side_effect function for subprocess.run that returns responses in order.
+
+    Each response is a dict with: stdout, stderr (optional), returncode (default 0).
+    """
+    call_index = [0]
+
+    def side_effect(args, **kwargs):
+        idx = call_index[0]
+        call_index[0] += 1
+        if idx >= len(responses):
+            resp = responses[-1]
+        else:
+            resp = responses[idx]
+        result = Mock(spec=subprocess.CompletedProcess)
+        result.stdout = resp.get("stdout", "")
+        result.stderr = resp.get("stderr", "")
+        result.returncode = resp.get("returncode", 0)
+        return result
+
+    return side_effect
+
+
 class TestTaskUpdate:
-    """Test task_update operation (GitHub PR updates)."""
+    """Test task_update operation (GitHub PR updates via gh CLI)."""
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_task_update_success(self, mock_client_class, operations):
-        """Test successful GitHub PR update."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        # Mock successful responses
-        mock_post_response = Mock()
-        mock_post_response.raise_for_status = Mock()
-
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-        mock_get_response.json.return_value = {"body": "Existing PR description"}
-
-        mock_patch_response = Mock()
-        mock_patch_response.raise_for_status = Mock()
-
-        mock_client.post.return_value = mock_post_response
-        mock_client.get.return_value = mock_get_response
-        mock_client.patch.return_value = mock_patch_response
+    @patch("scripts.post_pr_operations.subprocess.run")
+    def test_task_update_github_success(self, mock_run, operations):
+        """Test successful GitHub PR update via gh CLI."""
+        mock_run.side_effect = _mock_subprocess_run([
+            {"stdout": json.dumps([{"name": "code-review"}, {"name": "awaiting-review"}])},
+            {"stdout": json.dumps({"body": "Existing PR description"})},
+            {"stdout": json.dumps({"body": "Updated description"})},
+            {"stdout": json.dumps({"requested_reviewers": [{"login": "user1"}, {"login": "user2"}]})},
+        ])
 
         result = operations.task_update(
             pr_url="https://github.com/RedHatInsights/hcc-ai-assistant/pull/123",
@@ -78,37 +87,29 @@ class TestTaskUpdate:
         assert result.details["reviewers_requested"] == ["user1", "user2"]
         assert "code-review" in result.details["labels_added"]
 
-        # Verify labels API call
-        labels_call = mock_client.post.call_args_list[0]
-        assert labels_call[0][0] == "https://api.github.com/repos/RedHatInsights/hcc-ai-assistant/issues/123/labels"
-        assert labels_call[1]["json"]["labels"] == ["code-review", "awaiting-review"]
-        assert "token test-github-token" in labels_call[1]["headers"]["Authorization"]
+        labels_call = mock_run.call_args_list[0]
+        assert "repos/RedHatInsights/hcc-ai-assistant/issues/123/labels" in labels_call[0][0]
+        assert labels_call[1].get("input") is not None
+        labels_payload = json.loads(labels_call[1]["input"])
+        assert labels_payload["labels"] == ["code-review", "awaiting-review"]
 
-        # Verify GET PR call
-        get_call = mock_client.get.call_args
-        assert get_call[0][0] == "https://api.github.com/repos/RedHatInsights/hcc-ai-assistant/pulls/123"
+        get_call = mock_run.call_args_list[1]
+        assert "repos/RedHatInsights/hcc-ai-assistant/pulls/123" in get_call[0][0]
 
-        # Verify PATCH PR description call
-        patch_call = mock_client.patch.call_args
-        assert patch_call[0][0] == "https://api.github.com/repos/RedHatInsights/hcc-ai-assistant/pulls/123"
-        assert "TICKET-456" in patch_call[1]["json"]["body"]
-        assert "https://test-jira.example.com/browse/TICKET-456" in patch_call[1]["json"]["body"]
+        patch_call = mock_run.call_args_list[2]
+        assert "PATCH" in patch_call[0][0]
+        patch_payload = json.loads(patch_call[1]["input"])
+        assert "TICKET-456" in patch_payload["body"]
+        assert "https://test-jira.example.com/browse/TICKET-456" in patch_payload["body"]
 
-        # Verify reviewers API call
-        reviewers_call = mock_client.post.call_args_list[1]
-        assert (
-            reviewers_call[0][0]
-            == "https://api.github.com/repos/RedHatInsights/hcc-ai-assistant/pulls/123/requested_reviewers"
-        )
-        assert reviewers_call[1]["json"]["reviewers"] == ["user1", "user2"]
+        reviewers_call = mock_run.call_args_list[3]
+        assert "requested_reviewers" in " ".join(reviewers_call[0][0])
+        reviewers_payload = json.loads(reviewers_call[1]["input"])
+        assert reviewers_payload["reviewers"] == ["user1", "user2"]
 
     def test_task_update_dry_run(self, temp_dir):
         """Test GitHub PR update in dry-run mode."""
         operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="test-jira-token",
-            jira_email="test@example.com",
             slack_webhook="https://hooks.slack.com/test",
             memory_store_path=str(temp_dir / "memory.json"),
             dry_run=True,
@@ -122,26 +123,14 @@ class TestTaskUpdate:
         assert result.details["owner"] == "test"
         assert result.details["repo"] == "repo"
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_task_update_no_reviewers(self, mock_client_class, operations):
+    @patch("scripts.post_pr_operations.subprocess.run")
+    def test_task_update_no_reviewers(self, mock_run, operations):
         """Test GitHub PR update without reviewers."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        mock_post_response = Mock()
-        mock_post_response.raise_for_status = Mock()
-
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-        mock_get_response.json.return_value = {"body": "Existing PR description"}
-
-        mock_patch_response = Mock()
-        mock_patch_response.raise_for_status = Mock()
-
-        mock_client.post.return_value = mock_post_response
-        mock_client.get.return_value = mock_get_response
-        mock_client.patch.return_value = mock_patch_response
+        mock_run.side_effect = _mock_subprocess_run([
+            {"stdout": json.dumps([{"name": "code-review"}])},
+            {"stdout": json.dumps({"body": "Existing PR description"})},
+            {"stdout": json.dumps({"body": "Updated"})},
+        ])
 
         result = operations.task_update(
             pr_url="https://github.com/test/repo/pull/3", pr_number=3, ticket_id="TICKET-111", reviewers=None
@@ -149,71 +138,75 @@ class TestTaskUpdate:
 
         assert result.status == OperationStatus.SUCCESS
         assert result.details["reviewers_requested"] == []
-
-        # Verify API calls: labels + get PR + patch PR (no reviewers call)
-        assert mock_client.post.call_count == 1  # labels only
-        assert mock_client.get.call_count == 1  # get PR
-        assert mock_client.patch.call_count == 1  # update PR
-
-    def test_task_update_no_github_token(self, temp_dir, monkeypatch):
-        """Test GitHub PR update fails without token."""
-        # Clear env vars that would provide fallback tokens
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-
-        operations = PostPROperations(
-            github_token="",
-            jira_url="https://test.atlassian.net",
-            jira_token="test-jira-token",
-            jira_email="test@example.com",
-            slack_webhook="https://hooks.slack.com/test",
-            memory_store_path=str(temp_dir / "memory.json"),
-        )
-
-        result = operations.task_update(
-            pr_url="https://github.com/test/repo/pull/4", pr_number=4, ticket_id="TICKET-222", reviewers=None
-        )
-
-        assert result.status == OperationStatus.FAILED
-        assert "GitHub token not configured" in result.message
+        assert mock_run.call_count == 3  # labels, get PR, patch PR
 
     def test_task_update_invalid_url(self, operations):
-        """Test GitHub PR update with invalid URL."""
+        """Test PR update with invalid URL."""
         result = operations.task_update(
             pr_url="https://invalid.com/not/a/pr", pr_number=5, ticket_id="TICKET-333", reviewers=None
         )
 
         assert result.status == OperationStatus.FAILED
-        assert "Invalid GitHub PR URL" in result.message
+        assert "Unsupported PR URL" in result.message
+
+    @patch("scripts.post_pr_operations.subprocess.run")
+    def test_task_update_gh_cli_failure(self, mock_run, operations):
+        """Test GitHub PR update when gh CLI fails."""
+        mock_run.side_effect = _mock_subprocess_run([
+            {"returncode": 1, "stderr": "gh: Not Found (HTTP 404)"},
+        ])
+
+        result = operations.task_update(
+            pr_url="https://github.com/test/repo/pull/99", pr_number=99, ticket_id="TICKET-999", reviewers=None
+        )
+
+        assert result.status == OperationStatus.FAILED
+        assert "Failed to add labels" in result.message
+
+    @patch("scripts.post_pr_operations.subprocess.run")
+    def test_task_update_gitlab_success(self, mock_run, operations):
+        """Test successful GitLab MR update via glab CLI."""
+        mock_run.side_effect = _mock_subprocess_run([
+            {"stdout": json.dumps({"labels": ["code-review", "awaiting-review"]})},
+            {"stdout": json.dumps({"description": "Existing MR description"})},
+            {"stdout": json.dumps({"description": "Updated"})},
+            {"stdout": json.dumps([{"id": 42, "username": "reviewer1"}])},
+            {"stdout": json.dumps({"reviewers": [{"id": 42}]})},
+        ])
+
+        result = operations.task_update(
+            pr_url="https://gitlab.cee.redhat.com/insights-qe/test-repo/-/merge_requests/5",
+            pr_number=5,
+            ticket_id="TICKET-GL1",
+            reviewers=["reviewer1"],
+        )
+
+        assert result.status == OperationStatus.SUCCESS
+        assert result.details["owner"] == "insights-qe"
+        assert result.details["repo"] == "test-repo"
+        assert result.details["jira_ticket"] == "TICKET-GL1"
+
+        labels_call = mock_run.call_args_list[0]
+        assert "--hostname" in labels_call[0][0]
+        assert "gitlab.cee.redhat.com" in labels_call[0][0]
 
 
 class TestJiraTransitionIssue:
-    """Test jira_transition_issue operation."""
+    """Test jira_transition_issue operation (via MCP)."""
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_jira_transition_success(self, mock_client_class, operations):
-        """Test successful JIRA transition."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        # Mock GET transitions response
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-        mock_get_response.json.return_value = {
-            "transitions": [
-                {"id": "11", "to": {"name": "In Progress"}},
-                {"id": "21", "to": {"name": "Code Review"}},
-                {"id": "31", "to": {"name": "Done"}},
-            ]
-        }
-
-        # Mock POST transition response
-        mock_post_response = Mock()
-        mock_post_response.raise_for_status = Mock()
-
-        mock_client.get.return_value = mock_get_response
-        mock_client.post.return_value = mock_post_response
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_transition_success(self, mock_jira_call, operations):
+        """Test successful JIRA transition via MCP."""
+        mock_jira_call.side_effect = [
+            {
+                "transitions": [
+                    {"id": "11", "to": {"name": "In Progress"}},
+                    {"id": "21", "to": {"name": "Code Review"}},
+                    {"id": "31", "to": {"name": "Done"}},
+                ]
+            },
+            {"success": True},
+        ]
 
         result = operations.jira_transition_issue(ticket_id="TICKET-123", target_status="Code Review")
 
@@ -221,121 +214,73 @@ class TestJiraTransitionIssue:
         assert result.operation == "jira_transition_issue"
         assert "TICKET-123" in result.message
         assert result.details["status"] == "Code Review"
-        assert "jira_url" in result.details
 
-        # Verify GET request to fetch available transitions (API v3 with Basic auth)
-        mock_client.get.assert_called_once_with(
-            "https://test-jira.example.com/rest/api/3/issue/TICKET-123/transitions",
-            headers={
-                "Authorization": "Basic dGVzdEBleGFtcGxlLmNvbTp0ZXN0LWppcmEtdG9rZW4=",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            timeout=30.0,
-        )
+        assert mock_jira_call.call_count == 2
+        mock_jira_call.assert_any_call("jira_get_transitions", {"issue_key": "TICKET-123"})
+        mock_jira_call.assert_any_call("jira_transition_issue", {"issue_key": "TICKET-123", "transition_id": "21"})
 
-        # Verify POST request to execute the transition with correct transition ID
-        mock_client.post.assert_called_once_with(
-            "https://test-jira.example.com/rest/api/3/issue/TICKET-123/transitions",
-            headers={
-                "Authorization": "Basic dGVzdEBleGFtcGxlLmNvbTp0ZXN0LWppcmEtdG9rZW4=",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json={"transition": {"id": "21"}},  # ID for "Code Review"
-            timeout=30.0,
-        )
-
-    def test_jira_transition_no_token(self, temp_dir, monkeypatch):
-        """Test JIRA transition fails without token."""
-        monkeypatch.delenv("POST_PR_JIRA_TOKEN", raising=False)
-        operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="",
-            jira_email="test@example.com",
-            slack_webhook="https://hooks.slack.com/test",
-            memory_store_path=str(temp_dir / "memory.json"),
-        )
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_transition_mcp_unavailable(self, mock_jira_call, operations):
+        """Test JIRA transition fails when MCP returns None."""
+        mock_jira_call.return_value = None
 
         result = operations.jira_transition_issue(ticket_id="TICKET-456")
 
         assert result.status == OperationStatus.FAILED
-        assert "JIRA token not configured" in result.message
+        assert "Failed to get transitions" in result.message
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_jira_transition_invalid_status(self, mock_client_class, operations):
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_transition_invalid_status(self, mock_jira_call, operations):
         """Test JIRA transition fails when target status doesn't exist."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-        mock_get_response.json.return_value = {
+        mock_jira_call.return_value = {
             "transitions": [
                 {"id": "11", "to": {"name": "In Progress"}},
                 {"id": "21", "to": {"name": "Code Review"}},
             ]
         }
-
-        mock_client.get.return_value = mock_get_response
 
         result = operations.jira_transition_issue(ticket_id="TICKET-999", target_status="Nonexistent Status")
 
         assert result.status == OperationStatus.FAILED
         assert "Cannot transition to 'Nonexistent Status'" in result.message
         assert "Available transitions:" in result.message
-        # Verify POST was never called since transition wasn't found
-        mock_client.post.assert_not_called()
+        assert mock_jira_call.call_count == 1
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_jira_transition_custom_status(self, mock_client_class, operations):
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_transition_custom_status(self, mock_jira_call, operations):
         """Test JIRA transition to custom status."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        mock_get_response = Mock()
-        mock_get_response.raise_for_status = Mock()
-        mock_get_response.json.return_value = {
-            "transitions": [
-                {"id": "11", "to": {"name": "In Progress"}},
-                {"id": "21", "to": {"name": "Code Review"}},
-            ]
-        }
-
-        mock_post_response = Mock()
-        mock_post_response.raise_for_status = Mock()
-
-        mock_client.get.return_value = mock_get_response
-        mock_client.post.return_value = mock_post_response
+        mock_jira_call.side_effect = [
+            {
+                "transitions": [
+                    {"id": "11", "to": {"name": "In Progress"}},
+                    {"id": "21", "to": {"name": "Code Review"}},
+                ]
+            },
+            {"success": True},
+        ]
 
         result = operations.jira_transition_issue(ticket_id="TICKET-789", target_status="In Progress")
 
         assert result.status == OperationStatus.SUCCESS
         assert result.details["status"] == "In Progress"
+        mock_jira_call.assert_any_call("jira_transition_issue", {"issue_key": "TICKET-789", "transition_id": "11"})
 
-        # Verify correct transition ID was used for "In Progress"
-        mock_client.post.assert_called_once()
-        call_args = mock_client.post.call_args
-        assert call_args[1]["json"]["transition"]["id"] == "11"
+    def test_jira_transition_dry_run(self, operations):
+        """Test JIRA transition in dry-run mode skips MCP calls."""
+        operations.dry_run = True
+        result = operations.jira_transition_issue(ticket_id="TICKET-DRY")
+
+        assert result.status == OperationStatus.SUCCESS
+        assert result.details["status"] == "Code Review"
 
 
 class TestJiraAddComment:
-    """Test jira_add_comment operation."""
+    """Test jira_add_comment operation (via MCP)."""
 
-    @patch("scripts.post_pr_operations.httpx.Client")
-    def test_jira_add_comment_success(self, mock_client_class, operations):
-        """Test successful JIRA comment."""
-        # Mock HTTP responses
-        mock_client = Mock()
-        mock_client_class.return_value.__enter__.return_value = mock_client
-
-        mock_post_response = Mock()
-        mock_post_response.raise_for_status = Mock()
-
-        mock_client.post.return_value = mock_post_response
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_add_comment_success(self, mock_jira_call, operations):
+        """Test successful JIRA comment via MCP."""
+        mock_jira_call.return_value = {"id": "12345"}
 
         result = operations.jira_add_comment(
             ticket_id="TICKET-123", pr_url="https://github.com/test/repo/pull/1", summary="Test PR summary"
@@ -347,54 +292,31 @@ class TestJiraAddComment:
         assert "Test PR summary" in result.details["comment"]
         assert "https://github.com/test/repo/pull/1" in result.details["comment"]
 
-        # Verify POST request with ADF format comment (API v3 with Basic auth)
-        expected_comment_adf = {
-            "body": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [
-                            {"type": "text", "text": "Pull Request created: https://github.com/test/repo/pull/1"}
-                        ],
-                    },
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": "Summary: Test PR summary"}],
-                    },
-                ],
-            }
-        }
-        mock_client.post.assert_called_once_with(
-            "https://test-jira.example.com/rest/api/3/issue/TICKET-123/comment",
-            headers={
-                "Authorization": "Basic dGVzdEBleGFtcGxlLmNvbTp0ZXN0LWppcmEtdG9rZW4=",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            json=expected_comment_adf,
-            timeout=30.0,
-        )
+        mock_jira_call.assert_called_once_with("jira_add_comment", {
+            "issue_key": "TICKET-123",
+            "body": "Pull Request created: https://github.com/test/repo/pull/1\n\nSummary: Test PR summary",
+        })
 
-    def test_jira_add_comment_no_token(self, temp_dir, monkeypatch):
-        """Test JIRA comment fails without token."""
-        monkeypatch.delenv("POST_PR_JIRA_TOKEN", raising=False)
-        operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="",
-            jira_email="test@example.com",
-            slack_webhook="https://hooks.slack.com/test",
-            memory_store_path=str(temp_dir / "memory.json"),
-        )
+    @patch("scripts.post_pr_operations.jira_call")
+    def test_jira_add_comment_mcp_fails(self, mock_jira_call, operations):
+        """Test JIRA comment fails when MCP returns None."""
+        mock_jira_call.return_value = None
 
         result = operations.jira_add_comment(
             ticket_id="TICKET-456", pr_url="https://github.com/test/repo/pull/2", summary="Test"
         )
 
         assert result.status == OperationStatus.FAILED
-        assert "JIRA token not configured" in result.message
+        assert "Failed to add comment" in result.message
+
+    def test_jira_add_comment_dry_run(self, operations):
+        """Test JIRA comment in dry-run mode skips MCP calls."""
+        operations.dry_run = True
+        result = operations.jira_add_comment(
+            ticket_id="TICKET-DRY", pr_url="https://github.com/test/repo/pull/3", summary="Dry run"
+        )
+
+        assert result.status == OperationStatus.SUCCESS
 
 
 class TestSlackNotify:
@@ -403,7 +325,6 @@ class TestSlackNotify:
     @patch("scripts.post_pr_operations.httpx.Client")
     def test_slack_notify_success(self, mock_client_class, operations):
         """Test successful Slack notification."""
-        # Mock HTTP responses
         mock_client = Mock()
         mock_client_class.return_value.__enter__.return_value = mock_client
 
@@ -421,28 +342,21 @@ class TestSlackNotify:
         assert "#test-channel" in result.message
         assert result.details["channel"] == "#test-channel"
 
-        # Verify Slack webhook POST call
         mock_client.post.assert_called_once()
         call_args = mock_client.post.call_args
 
-        # Verify webhook URL
         assert call_args[0][0] == "https://hooks.slack.com/test"
-
-        # Verify timeout
         assert call_args[1]["timeout"] == 30.0
 
-        # Verify message structure
         message_json = call_args[1]["json"]
         assert message_json["channel"] == "#test-channel"
         assert message_json["text"] == "New PR created: #1"
         assert "attachments" in message_json
         assert len(message_json["attachments"]) == 1
 
-        # Verify attachment details
         attachment = message_json["attachments"][0]
         assert attachment["color"] == "good"
 
-        # Verify fields in attachment
         fields = attachment["fields"]
         assert len(fields) == 2
         assert fields[0]["title"] == "PR"
@@ -456,10 +370,6 @@ class TestSlackNotify:
         """Test Slack notification fails without webhook."""
         monkeypatch.delenv("POST_PR_SLACK_WEBHOOK", raising=False)
         operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="test-jira-token",
-            jira_email="test@example.com",
             slack_webhook="",
             memory_store_path=str(temp_dir / "memory.json"),
         )
@@ -474,7 +384,6 @@ class TestSlackNotify:
     @patch("scripts.post_pr_operations.httpx.Client")
     def test_slack_notify_default_channel(self, mock_client_class, operations):
         """Test Slack notification with default channel."""
-        # Mock HTTP responses
         mock_client = Mock()
         mock_client_class.return_value.__enter__.return_value = mock_client
 
@@ -488,7 +397,6 @@ class TestSlackNotify:
         assert result.status == OperationStatus.SUCCESS
         assert result.details["channel"] == "#hcc-ai-assistant"
 
-        # Verify default channel was used in the message
         call_args = mock_client.post.call_args
         message_json = call_args[1]["json"]
         assert message_json["channel"] == "#hcc-ai-assistant"
@@ -513,7 +421,6 @@ class TestMemoryStore:
         assert result.operation == "memory_store"
         assert result.details["learnings"] == learnings
 
-        # Verify file was written
         memory_file = Path(operations.memory_store_path)
         assert memory_file.exists()
         with open(memory_file, "r") as f:
@@ -524,21 +431,18 @@ class TestMemoryStore:
 
     def test_memory_store_append(self, operations):
         """Test memory storage appends to existing file."""
-        # First entry
         operations.memory_store(
             pr_url="https://github.com/test/repo/pull/1",
             ticket_id="TICKET-123",
             learnings={"patterns": ["Pattern 1"]},
         )
 
-        # Second entry
         operations.memory_store(
             pr_url="https://github.com/test/repo/pull/2",
             ticket_id="TICKET-456",
             learnings={"patterns": ["Pattern 2"]},
         )
 
-        # Verify both entries exist
         with open(operations.memory_store_path, "r") as f:
             memories = json.load(f)
             assert len(memories) == 2
@@ -548,10 +452,6 @@ class TestMemoryStore:
     def test_memory_store_dry_run(self, temp_dir):
         """Test memory storage in dry-run mode."""
         operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="test-jira-token",
-            jira_email="test@example.com",
             slack_webhook="https://hooks.slack.com/test",
             memory_store_path=str(temp_dir / "memory.json"),
             dry_run=True,
@@ -562,7 +462,6 @@ class TestMemoryStore:
         )
 
         assert result.status == OperationStatus.SUCCESS
-        # File should not be created in dry-run mode
         assert not Path(operations.memory_store_path).exists()
 
 
@@ -578,7 +477,6 @@ class TestBotStatusUpdate:
         assert "idle" in result.message
         assert result.details["status"] == "idle"
 
-        # Verify status file was written
         status_file = Path("/tmp/bot_status.json")
         assert status_file.exists()
         with open(status_file, "r") as f:
@@ -595,10 +493,6 @@ class TestBotStatusUpdate:
     def test_bot_status_update_dry_run(self, temp_dir):
         """Test bot status update in dry-run mode."""
         operations = PostPROperations(
-            github_token="test-token",
-            jira_url="https://test.atlassian.net",
-            jira_token="test-jira-token",
-            jira_email="test@example.com",
             slack_webhook="https://hooks.slack.com/test",
             memory_store_path=str(temp_dir / "memory.json"),
             dry_run=True,
@@ -622,7 +516,7 @@ class TestOperationResult:
         assert result.status == OperationStatus.SUCCESS
         assert result.message == "Test message"
         assert result.details == {"key": "value"}
-        assert result.timestamp  # Should have a timestamp
+        assert result.timestamp
 
     def test_operation_result_failed_status(self):
         """Test OperationResult with failed status."""
@@ -659,3 +553,40 @@ class TestWorkflowResult:
         assert len(result_dict["operations"]) == 2
         assert result_dict["operations"][0]["status"] == "success"
         assert result_dict["operations"][1]["status"] == "failed"
+
+
+class TestParseURL:
+    """Test URL parsing for GitHub and GitLab."""
+
+    def test_parse_github_url(self, operations):
+        """Test parsing GitHub PR URL."""
+        info = operations._parse_pr_url("https://github.com/RedHatInsights/hcc-ai-assistant/pull/123")
+        assert info["host"] == "github"
+        assert info["owner"] == "RedHatInsights"
+        assert info["repo"] == "hcc-ai-assistant"
+
+    def test_parse_gitlab_url(self, operations):
+        """Test parsing GitLab MR URL."""
+        info = operations._parse_pr_url(
+            "https://gitlab.cee.redhat.com/insights-qe/test-repo/-/merge_requests/5"
+        )
+        assert info["host"] == "gitlab"
+        assert info["hostname"] == "gitlab.cee.redhat.com"
+        assert info["owner"] == "insights-qe"
+        assert info["repo"] == "test-repo"
+        assert info["project_path"] == "insights-qe/test-repo"
+
+    def test_parse_gitlab_nested_url(self, operations):
+        """Test parsing GitLab MR URL with nested groups."""
+        info = operations._parse_pr_url(
+            "https://gitlab.cee.redhat.com/service/platform/backend/-/merge_requests/42"
+        )
+        assert info["host"] == "gitlab"
+        assert info["owner"] == "service/platform"
+        assert info["repo"] == "backend"
+        assert info["project_path"] == "service/platform/backend"
+
+    def test_parse_unsupported_url(self, operations):
+        """Test parsing unsupported URL raises error."""
+        with pytest.raises(ValueError, match="Unsupported PR URL"):
+            operations._parse_pr_url("https://bitbucket.org/team/repo/pull-requests/1")

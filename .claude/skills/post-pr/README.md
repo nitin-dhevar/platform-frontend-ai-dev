@@ -80,7 +80,6 @@ result = execute_post_pr_workflow(
     ticket_id="RHCLOUD-456",
     summary="Add vector search caching",
     github_token=None,  # Falls back to GITHUB_TOKEN env var
-    jira_token=None,    # Falls back to POST_PR_JIRA_TOKEN env var
     slack_channel="#hcc-ai-assistant",
     reviewers=["user1", "user2"],
     skip_operations=[],
@@ -103,13 +102,12 @@ else:
 Set these environment variables for API integrations:
 
 ```bash
-# GitHub (required)
-export GITHUB_TOKEN=ghp_your_token_here  # Or GH_TOKEN
+# GitHub — uses `gh` CLI (already authenticated in container, no token needed)
+# GitLab — uses `glab` CLI (already authenticated in container, no token needed)
 
-# JIRA Cloud (required for JIRA operations)
-export POST_PR_JIRA_TOKEN=your_api_token_here
-export POST_PR_JIRA_EMAIL=your.email@redhat.com
-export POST_PR_JIRA_URL=https://redhat.atlassian.net  # Optional, this is the default
+# JIRA (via MCP — requires JIRA_MCP_URL to be set)
+export JIRA_MCP_URL=http://localhost:9090/mcp  # mcp-atlassian server URL
+export POST_PR_JIRA_URL=https://redhat.atlassian.net  # Optional, used for browse links only
 
 # Slack (required for Slack notifications)
 export POST_PR_SLACK_WEBHOOK=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
@@ -118,7 +116,7 @@ export POST_PR_SLACK_WEBHOOK=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
 export POST_PR_MEMORY_STORE=/path/to/memory.json  # Default: /tmp/memory.json
 ```
 
-**Note:** Uses JIRA Cloud API v3 with Basic authentication (email + API token).
+**Note:** No API tokens needed. GitHub/GitLab operations use their respective CLIs (`gh`/`glab`), JIRA uses MCP via `jira_call`.
 
 ## Testing
 
@@ -188,20 +186,23 @@ Managed with **uv** for fast, reliable dependency resolution.
 
 ## API Integrations
 
-### GitHub REST API
-- **Authentication**: Bearer token (GITHUB_TOKEN or GH_TOKEN)
+### GitHub (via `gh` CLI)
+- **Authentication**: Handled by `gh` CLI (pre-authenticated)
 - **Operations**: Add labels, update PR description, request reviewers
-- **Endpoint**: `https://api.github.com`
+- **Commands**: `gh api repos/{owner}/{repo}/...`
 
-### JIRA Cloud API v3
-- **Authentication**: Basic (email:token)
-- **Transitions**: `GET/POST /rest/api/3/issue/{key}/transitions`
-- **Comments**: Atlassian Document Format (ADF)
-- **Endpoint**: `https://redhat.atlassian.net` (default)
-- **Note**: Requires API v3 (v2 returns empty transitions array)
+### GitLab (via `glab` CLI)
+- **Authentication**: Handled by `glab` CLI (pre-authenticated)
+- **Operations**: Add labels, update MR description, request reviewers
+- **Commands**: `glab api projects/{path}/merge_requests/{n}/... --hostname <host>`
+
+### JIRA (via MCP)
+- **Authentication**: Handled by mcp-atlassian server
+- **Operations**: Get transitions, transition issue, add comment
+- **Client**: `jira_call()` from shared `jira_mcp.py`
 
 ### Slack Webhooks
-- **Format**: Incoming webhook with attachment format
+- **Format**: Incoming webhook with attachment format (httpx)
 - **Fields**: PR number, link, summary
 - **Color coding**: "good" (green) for PR created events
 
@@ -209,23 +210,17 @@ Managed with **uv** for fast, reliable dependency resolution.
 
 ### Common Issues
 
-**Error: "GitHub token not configured"**
-- Set `GITHUB_TOKEN` or `GH_TOKEN` environment variable
-- Or pass `--github-token` parameter
+**Error: "Failed to add labels" / gh CLI errors**
+- Ensure `gh` CLI is installed and authenticated (`gh auth status`)
+- For GitLab, ensure `glab` is installed and authenticated
 
-**Error: "JIRA token not configured"**
-- Set `POST_PR_JIRA_TOKEN` and `POST_PR_JIRA_EMAIL` environment variables
+**Error: "Failed to get transitions from Jira MCP"**
+- Ensure `JIRA_MCP_URL` is set and the mcp-atlassian server is running
 - Or run with `--skip=jira` to skip JIRA operations
-- **Note**: Requires JIRA Cloud API v3 (redhat.atlassian.net)
 
 **Error: "Slack webhook not configured"**
 - Set `POST_PR_SLACK_WEBHOOK` environment variable
 - Or run with `--skip=slack` to skip Slack notifications
-
-**JIRA transitions return empty array**
-- Ensure using JIRA Cloud API v3 (not v2)
-- Check `POST_PR_JIRA_URL` is set to `https://redhat.atlassian.net`
-- Verify email and token are correct for Basic auth
 
 **Workflow stops partway through**
 - This is expected behavior (fail-fast)
