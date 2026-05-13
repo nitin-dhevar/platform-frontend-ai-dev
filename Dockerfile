@@ -145,9 +145,8 @@ ENV CLOUD_ML_REGION=global
 ENV BUILDAH_ISOLATION=chroot
 
 # Copy bot config files
-COPY config.json project-repos.json CLAUDE.md .mcp.json entrypoint.sh ./
+COPY config.json CLAUDE.md .mcp.json entrypoint.sh ./
 COPY .claude/ .claude/
-COPY personas/ personas/
 
 # Run post-pr skill tests during build (validates skill before image is finalized)
 RUN cd .claude/skills/post-pr \

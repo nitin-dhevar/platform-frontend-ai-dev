@@ -3,7 +3,6 @@
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import shutil
@@ -19,6 +18,7 @@ from filelock import FileLock, Timeout
 from .agent import run_cycle
 from .config import ALLOWED_TOOLS, Config, load_config, load_mcp_servers, sanitize_env
 from .costs import record_cost
+from .merge import apply_merged_config
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = SCRIPT_DIR / "data"
@@ -155,63 +155,6 @@ def sync_config_repo() -> Path | None:
     return agent_dir
 
 
-def _copytree_content_only(src: Path, dst: Path, **kwargs) -> None:
-    """copytree using copyfile (content-only) to avoid EPERM from chmod/copystat
-    under OpenShift arbitrary UIDs on overlay FS.  Re-raises real file copy
-    errors but suppresses directory copystat failures (always emitted by
-    copytree internals).
-    """
-    try:
-        shutil.copytree(src, dst, copy_function=shutil.copyfile, **kwargs)
-    except shutil.Error as exc:
-        real_errors = [e for e in exc.args[0] if not os.path.isdir(e[0])]
-        if real_errors:
-            raise shutil.Error(real_errors) from None
-
-
-def apply_remote_config(script_dir: Path, agent_dir: Path) -> None:
-    """Overlay remote agent config onto working directory."""
-    logger = logging.getLogger(__name__)
-
-    remote_personas = agent_dir / "personas"
-    if remote_personas.is_dir():
-        _copytree_content_only(
-            remote_personas, script_dir / "personas", dirs_exist_ok=True,
-        )
-        logger.info("Applied remote personas")
-
-    remote_repos = agent_dir / "project-repos.json"
-    if remote_repos.is_file():
-        shutil.copyfile(remote_repos, script_dir / "project-repos.json")
-        logger.info("Applied remote project-repos.json")
-
-    remote_skills = agent_dir / "skills"
-    if remote_skills.is_dir():
-        _copytree_content_only(
-            remote_skills, script_dir / ".claude" / "skills",
-            dirs_exist_ok=True, ignore=shutil.ignore_patterns(".gitkeep"),
-        )
-        logger.info("Applied remote custom skills")
-
-    remote_mcp = agent_dir / "mcp.json"
-    if remote_mcp.is_file():
-        merged_path = DATA_DIR / "merged-mcp.json"
-        try:
-            with open(script_dir / "bot" / "mcp.json") as f:
-                built_in = json.load(f)
-            with open(remote_mcp) as f:
-                custom = json.load(f)
-            for name, cfg in custom.get("mcpServers", {}).items():
-                if name not in built_in.get("mcpServers", {}):
-                    built_in.setdefault("mcpServers", {})[name] = cfg
-            new_content = json.dumps(built_in, indent=2) + "\n"
-            existing = merged_path.read_text() if merged_path.exists() else ""
-            if new_content != existing:
-                merged_path.write_text(new_content)
-                logger.info("Merged remote MCP servers → %s", merged_path)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Failed to merge remote MCP config: %s", exc)
-
 
 LOW_DISK_THRESHOLD_MB = 512
 
@@ -323,7 +266,7 @@ def main() -> None:
         while True:
             remote_agent_dir = sync_config_repo()
             if remote_agent_dir:
-                apply_remote_config(SCRIPT_DIR, remote_agent_dir)
+                apply_merged_config(SCRIPT_DIR, remote_agent_dir)
 
             logger.info("Running agent cycle...")
 
