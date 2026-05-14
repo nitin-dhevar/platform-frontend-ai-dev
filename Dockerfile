@@ -162,6 +162,12 @@ RUN cd .claude/skills/claim-ticket \
     && uv run pytest -v --tb=short \
     && echo "Claim-ticket skill tests passed!"
 
+# Run push-and-pr skill tests during build
+RUN cd .claude/skills/push-and-pr \
+    && uv sync --frozen --all-extras \
+    && uv run pytest -v --tb=short \
+    && echo "Push-and-PR skill tests passed!"
+
 ENV HOME=/home/botuser
 USER botuser
 

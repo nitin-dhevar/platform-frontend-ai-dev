@@ -1,13 +1,3 @@
-Metadata-Version: 2.4
-Name: push-and-pr-skill
-Version: 0.1.0
-Summary: Push and PR workflow automation for HCC AI Assistant
-Requires-Python: >=3.12
-Description-Content-Type: text/markdown
-Provides-Extra: dev
-Requires-Dist: pytest>=8.0.0; extra == "dev"
-Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
-
 ---
 name: push-and-pr
 description: >

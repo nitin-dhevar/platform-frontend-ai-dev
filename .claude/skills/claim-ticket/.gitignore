@@ -17,6 +17,9 @@ build/
 .coverage
 htmlcov/
 
+# ruff
+.ruff_cache/
+
 # IDE
 .vscode/
 .idea/
