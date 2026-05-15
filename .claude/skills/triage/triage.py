@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from jira_mcp import jira_call
+from paths import SLEEP_FILE
 
 MEMORY_URL = os.environ.get("BOT_MEMORY_URL", "http://localhost:8080").rstrip("/mcp").rstrip("/")
 PROJECT_REPOS = Path(__file__).resolve().parent.parent.parent.parent / "project-repos.json"
@@ -420,6 +421,9 @@ def main():
     total = len(merged) + len(closed) + len(ci_fail) + len(conflict) + len(feedback) + len(interrupted)
     if total == 0:
         print("-> all clean -> Priority 2")
+        if active_n >= max_n:
+            SLEEP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SLEEP_FILE.write_text(json.dumps({"recommended_sleep": 3600, "reason": "at_capacity_all_clean"}))
     else:
         print(f"-> {total} task(s) need work. Top bucket first. ONE/cycle.")
 

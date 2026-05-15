@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -156,12 +157,42 @@ def sync_config_repo() -> Path | None:
 
 
 
+SLEEP_SIGNAL_FILE = DATA_DIR / "cycle-sleep.json"
 LOW_DISK_THRESHOLD_MB = 512
+
+
+def _read_sleep_signal(config: Config) -> int:
+    """Read sleep duration from skill-written signal file.
+
+    Skills write data/cycle-sleep.json with {"recommended_sleep": N, "reason": "..."}.
+    No file = standard interval (work was done). File is always deleted after reading.
+    """
+    logger = logging.getLogger(__name__)
+    sleep_seconds = config.interval
+
+    if SLEEP_SIGNAL_FILE.exists():
+        try:
+            sig = json.loads(SLEEP_SIGNAL_FILE.read_text())
+            sleep_seconds = sig.get("recommended_sleep", config.interval)
+            reason = sig.get("reason", "")
+            logger.info("Sleep signal: %ds (%s)", sleep_seconds, reason)
+        except Exception:
+            logger.warning("Bad sleep signal file, using default %ds", config.interval)
+        finally:
+            SLEEP_SIGNAL_FILE.unlink(missing_ok=True)
+    else:
+        logger.info("No sleep signal, using default %ds", config.interval)
+
+    logger.info("Sleeping for %ds...", sleep_seconds)
+    time.sleep(sleep_seconds)
+    return sleep_seconds
 
 
 def cleanup_between_cycles(script_dir: Path) -> None:
     """Free disk space between cycles if below threshold."""
     logger = logging.getLogger(__name__)
+
+    SLEEP_SIGNAL_FILE.unlink(missing_ok=True)
 
     try:
         usage = shutil.disk_usage(str(script_dir))
@@ -292,27 +323,17 @@ def main() -> None:
                 result, ctx = None, None
 
             if result is not None:
-                no_work = record_cost(
+                record_cost(
                     costs_file=DATA_DIR / "costs.jsonl",
                     label=args.label,
                     result=result,
                     ctx=ctx,
                 )
             else:
-                no_work = False
                 logger.warning("Cycle produced no result")
 
-            cleanup_between_cycles(SCRIPT_DIR)
+            sleep_seconds = _read_sleep_signal(config)
 
-            if no_work:
-                logger.info(
-                    "No work found. Sleeping for %ds...", config.idle_interval
-                )
-                time.sleep(config.idle_interval)
-            else:
-                logger.info(
-                    "Cycle complete. Sleeping for %ds...", config.interval
-                )
-                time.sleep(config.interval)
+            cleanup_between_cycles(SCRIPT_DIR)
     finally:
         lock.release()

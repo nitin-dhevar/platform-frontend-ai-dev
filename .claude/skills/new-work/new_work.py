@@ -15,6 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from jira_mcp import jira_call
+from paths import SLEEP_FILE
 
 PROJECT_REPOS = Path(__file__).resolve().parent.parent.parent.parent / "project-repos.json"
 BOT_LABEL = os.environ.get("BOT_LABEL", "")
@@ -186,6 +187,8 @@ def main():
     candidates = get_candidates()
     if not candidates:
         print("NO CANDIDATES FOUND")
+        SLEEP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SLEEP_FILE.write_text(json.dumps({"recommended_sleep": 3600, "reason": "no_eligible_work"}))
         return
 
     print(f"NEW WORK CANDIDATES ({len(candidates)})")

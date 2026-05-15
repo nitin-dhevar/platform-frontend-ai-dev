@@ -157,6 +157,12 @@ ONE item per cycle. Priority order:
 - Cycle end: `idle`, "Cycle complete. Sleeping..." or "No work found. Sleeping..."
 - Error: `error`, "<what went wrong>"
 
+**Sleep signaling**: Skills write `data/cycle-sleep.json` to tell the Python runner how long to sleep. The agent does NOT need to manage this — it's automatic:
+- `/triage` writes `recommended_sleep: 3600` when at capacity + all tasks clean (nothing actionable)
+- `/new-work` writes `recommended_sleep: 3600` when no eligible candidates found
+- No signal file = standard 300s sleep (work was done)
+- The runner reads and deletes the file after each cycle
+
 ### Triage (start of every cycle)
 
 Invoke `/triage` skill first. It runs a script that pre-gathers all active tasks, PR/MR statuses (state, CI, reviews, merge conflicts), Jira comments, PR comments, and capacity — grouped by action bucket (MERGED, CI_FAIL, CONFLICTS, FEEDBACK, INTERRUPTED, CLEAN).
