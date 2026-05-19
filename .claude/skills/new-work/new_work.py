@@ -22,6 +22,8 @@ BOT_LABEL = os.environ.get("BOT_LABEL", "")
 BOT_BOARD_ID = os.environ.get("BOT_BOARD_ID", "")
 BOT_BOARD_NAME = os.environ.get("BOT_BOARD_NAME", "")
 BOT_INCLUDE_BACKLOG = os.environ.get("BOT_INCLUDE_BACKLOG", "").lower() in ("1", "true", "yes")
+BOT_JIRA_EMAIL = os.environ.get("BOT_JIRA_EMAIL", "")
+BOT_SPRINT_PREFIX = os.environ.get("BOT_SPRINT_PREFIX", "")
 NOT_STARTED_STATUSES = ("New", "Backlog", "Refinement", "To Do")
 
 
@@ -67,14 +69,25 @@ def get_active_sprint():
     data = jira_call("jira_get_sprints_from_board", {
         "board_id": board_id,
         "state": "active",
-        "limit": 1,
+        "limit": 10,
     })
     if not data:
         return None
     sprints = data if isinstance(data, list) else data.get("values", [])
-    if sprints:
-        print(f"Active sprint: {sprints[0].get('name', '?')} (id={sprints[0]['id']})", file=sys.stderr)
-    return sprints[0] if sprints else None
+    if not sprints:
+        return None
+    if BOT_SPRINT_PREFIX:
+        matched = [s for s in sprints if s.get("name", "").startswith(BOT_SPRINT_PREFIX)]
+        if matched:
+            sprint = matched[0]
+            print(f"Active sprint (prefix={BOT_SPRINT_PREFIX}): {sprint.get('name', '?')} (id={sprint['id']})", file=sys.stderr)
+            return sprint
+        names = [s.get("name", "?") for s in sprints]
+        print(f"WARN: no sprint matching prefix '{BOT_SPRINT_PREFIX}', available: {names}", file=sys.stderr)
+        return None
+    sprint = sprints[0]
+    print(f"Active sprint: {sprint.get('name', '?')} (id={sprint['id']})", file=sys.stderr)
+    return sprint
 
 
 def load_project_repos():
@@ -118,7 +131,7 @@ def get_candidates():
     if sprint:
         jql = (
             f"project = RHCLOUD AND labels = {BOT_LABEL} "
-            f"AND assignee is EMPTY AND status IN ({status_list}) "
+            f"AND status IN ({status_list}) "
             f"AND sprint = {sprint['id']} "
             f"ORDER BY priority DESC, created ASC"
         )
@@ -126,9 +139,13 @@ def get_candidates():
 
     if len(candidates) < 10 and BOT_INCLUDE_BACKLOG:
         existing_keys = {c["key"] for c in candidates}
+        if BOT_JIRA_EMAIL:
+            assignee_filter = f'AND (assignee is EMPTY OR assignee = "{BOT_JIRA_EMAIL}") '
+        else:
+            assignee_filter = "AND assignee is EMPTY "
         jql = (
             f"project = RHCLOUD AND labels = {BOT_LABEL} "
-            f"AND assignee is EMPTY AND status IN ({status_list}) "
+            f"{assignee_filter}AND status IN ({status_list}) "
             f"AND sprint is EMPTY "
             f"ORDER BY priority DESC, created ASC"
         )
