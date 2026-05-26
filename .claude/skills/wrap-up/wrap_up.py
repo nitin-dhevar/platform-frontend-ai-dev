@@ -141,6 +141,9 @@ def archive_task(jira_key, summary):
 
 
 def slack_notify(jira_key, pr_info):
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    if not webhook_url:
+        return False, "SLACK_WEBHOOK_URL not set"
     pr_links = []
     for p in pr_info:
         pr_url = p.get("url", "")
@@ -164,6 +167,7 @@ def slack_notify(jira_key, pr_info):
                     "jira_key": jira_key,
                     "event_type": "release_pending",
                     "message": msg,
+                    "webhook_url": webhook_url,
                 },
             },
         },
