@@ -40,7 +40,7 @@ jobs:
         working-directory: .claude/skills/${{ matrix.skill }}
         run: |
           if [ -f pyproject.toml ]; then
-            uv sync
+            uv sync --all-extras
           fi
 
       - name: Lint with ruff
