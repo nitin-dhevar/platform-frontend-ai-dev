@@ -172,5 +172,9 @@
   "cypress-e2e-image": {
     "url": "https://github.com/platex-rehor-bot/cypress-e2e-image.git",
     "upstream": "https://github.com/RedHatInsights/cypress-e2e-image.git"
+  },
+  "scalprum/scaffolding": {
+    "url": "https://github.com/platex-rehor-bot/scaffolding.git",
+    "upstream": "https://github.com/scalprum/scaffolding.git"
   }
 }
