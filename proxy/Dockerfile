@@ -1,5 +1,5 @@
 # Build executor binaries
-FROM registry.access.redhat.com/ubi9/go-toolset:latest AS executor-builder
+FROM registry.access.redhat.com/ubi9/go-toolset:latest@sha256:a2ba4645e7c424b08aa83ed7792e279683b0d33acbc5131b18183fd21e336c55 AS executor-builder
 WORKDIR /build
 COPY executor/ .
 RUN go mod download \
