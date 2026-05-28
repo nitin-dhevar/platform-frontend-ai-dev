@@ -14,6 +14,7 @@ from auto_fork import (
     OperationStatus,
     RepoInfo,
 )
+from tests.conftest import GITLAB_HOST
 
 
 @pytest.fixture
@@ -36,17 +37,20 @@ class TestDetectUnforkableRepos:
 
         assert result.status == OperationStatus.SUCCESS
         assert "test-repo-2" in result.details["repos"]
+        assert "gitlab-repo" in result.details["repos"]
         assert "test-repo-1" not in result.details["repos"]  # Already has fork
-        assert len(operations.repos_to_fork) == 1
-        assert operations.repos_to_fork[0].name == "test-repo-2"
+        assert len(operations.repos_to_fork) == 2
+        repo_names = {r.name for r in operations.repos_to_fork}
+        assert repo_names == {"test-repo-2", "gitlab-repo"}
 
-    def test_detect_skips_gitlab(self, operations):
-        """Test GitLab repos are skipped."""
+    def test_detect_includes_gitlab(self, operations):
+        """Test GitLab repos are included."""
         result = operations.detect_unforkable_repos()
 
         assert result.status == OperationStatus.SUCCESS
         gitlab_repos = [r for r in operations.repos_to_fork if r.host == "gitlab"]
-        assert len(gitlab_repos) == 0
+        assert len(gitlab_repos) == 1
+        assert gitlab_repos[0].name == "gitlab-repo"
 
     def test_detect_missing_username(self, monkeypatch):
         """Test failure when GH_USER_NAME not set."""
@@ -70,6 +74,7 @@ class TestDetectUnforkableRepos:
         with open(operations.project_repos_path) as f:
             repos = json.load(f)
         repos["test-repo-2"]["url"] = f"https://github.com/{operations.bot_username}/test-repo-2.git"
+        repos["gitlab-repo"]["url"] = f"https://{GITLAB_HOST}/{operations.gl_username}/gitlab-repo.git"
         with open(operations.project_repos_path, "w") as f:
             json.dump(repos, f)
 
@@ -149,6 +154,34 @@ class TestForkRepos:
 
         assert result.status == OperationStatus.SKIPPED
         assert "No repos to fork" in result.message
+
+    @patch("auto_fork.subprocess.run")
+    def test_fork_gitlab_success(self, mock_run, operations, mock_subprocess_result):
+        """Test successful GitLab repo forking."""
+        operations.repos_to_fork = [
+            RepoInfo(
+                name="gitlab-repo",
+                upstream=f"https://{GITLAB_HOST}/TestOrg/gitlab-repo.git",
+                current_url=None,
+                host="gitlab",
+            )
+        ]
+
+        mock_run.return_value = mock_subprocess_result()
+
+        result = operations.fork_repos()
+
+        assert result.status == OperationStatus.SUCCESS
+        assert "gitlab-repo" in operations.forked_repos
+        assert (
+            operations.forked_repos["gitlab-repo"] == f"https://{GITLAB_HOST}/{operations.gl_username}/gitlab-repo.git"
+        )
+        # Verify glab command was called with correct args
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert call_args[0] == "glab"
+        assert "--hostname" in call_args
+        assert GITLAB_HOST in call_args
 
     def test_fork_dry_run(self, operations):
         """Test dry run mode."""

@@ -37,6 +37,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent.parent
 DATA_DIR = SCRIPT_DIR / "data"
 REMOTE_CONFIG_DIR = DATA_DIR / "remote-config"
 
+# GitLab hostname constant
+GITLAB_HOST = "gitlab.cee.redhat.com"
+
 
 class OperationStatus(Enum):
     """Status of an individual operation."""
@@ -81,6 +84,7 @@ class AutoForkOperations:
         """
         self.dry_run = dry_run
         self.bot_username = os.environ.get("GH_USER_NAME", "")
+        self.gl_username = os.environ.get("GL_USER_NAME", "")
         self.instance_id = os.environ.get("BOT_INSTANCE_ID", "")
         self.config_path = os.environ.get("BOT_CONFIG_PATH", "rehor-config")
 
@@ -169,7 +173,6 @@ class AutoForkOperations:
             )
 
         repos_to_fork = []
-        gitlab_repos = []
 
         for name, config in repos_config.items():
             upstream = config.get("upstream")
@@ -179,16 +182,17 @@ class AutoForkOperations:
             if not upstream:
                 continue  # No upstream = not a fork, skip
 
-            # Check if URL already points to bot's fork
-            if current_url and self.bot_username in current_url:
-                logger.debug(f"{name}: already forked to {self.bot_username}")
-                continue
-
             # Determine host from upstream URL if not specified
             if "gitlab" in upstream.lower():
                 host = "gitlab"
             elif "github" in upstream.lower():
                 host = "github"
+
+            # Check if URL already points to bot's fork
+            bot_user = self.gl_username if host == "gitlab" else self.bot_username
+            if current_url and bot_user and bot_user in current_url:
+                logger.debug(f"{name}: already forked to {bot_user}")
+                continue
 
             repo_info = RepoInfo(
                 name=name,
@@ -196,24 +200,15 @@ class AutoForkOperations:
                 current_url=current_url,
                 host=host,
             )
-
-            if host == "gitlab":
-                gitlab_repos.append(repo_info)
-            else:
-                repos_to_fork.append(repo_info)
+            repos_to_fork.append(repo_info)
 
         self.repos_to_fork = repos_to_fork
 
         # Log summary
         if repos_to_fork:
-            logger.info(f"Found {len(repos_to_fork)} GitHub repos needing forks:")
+            logger.info(f"Found {len(repos_to_fork)} repos needing forks:")
             for repo in repos_to_fork:
-                logger.info(f"  - {repo.name}: {repo.upstream}")
-
-        if gitlab_repos:
-            logger.warning(f"Skipping {len(gitlab_repos)} GitLab repos (manual forking required):")
-            for repo in gitlab_repos:
-                logger.warning(f"  - {repo.name}: {repo.upstream}")
+                logger.info(f"  - {repo.name} ({repo.host}): {repo.upstream}")
 
         if not repos_to_fork:
             return OperationResult(
@@ -229,21 +224,24 @@ class AutoForkOperations:
             details={"repos": [r.name for r in repos_to_fork]},
         )
 
-    def _get_fork_url(self, repo_name: str) -> str:
+    def _get_fork_url(self, repo_name: str, host: str) -> str:
         """
         Generate fork URL for a repository.
 
         Args:
             repo_name: Name of the repository
+            host: Host type ("github" or "gitlab")
 
         Returns:
-            Fork URL in format: https://github.com/{bot_username}/{repo_name}.git
+            Fork URL in appropriate format for the host
         """
+        if host == "gitlab":
+            return f"https://{GITLAB_HOST}/{self.gl_username}/{repo_name}.git"
         return f"https://github.com/{self.bot_username}/{repo_name}.git"
 
     def fork_repos(self) -> OperationResult:
         """
-        Create forks for detected repos using gh repo fork.
+        Create forks for detected repos using gh or glab.
 
         Returns:
             OperationResult with fork details
@@ -263,19 +261,33 @@ class AutoForkOperations:
             parsed = urlparse(repo.upstream)
             path = parsed.path.rstrip(".git").lstrip("/")
 
-            logger.info(f"Forking {path}...")
+            logger.info(f"Forking {path} ({repo.host})...")
 
             if self.dry_run:
-                fork_url = self._get_fork_url(repo.name)
+                fork_url = self._get_fork_url(repo.name, repo.host)
                 self.forked_repos[repo.name] = fork_url
                 logger.info(f"[DRY RUN] Would fork {path} to {fork_url}")
                 continue
 
             try:
-                # Use gh repo fork to create the fork
-                # --clone=false prevents automatic cloning
+                # Build fork command based on host
+                if repo.host == "gitlab":
+                    # glab repo fork --clone=false --hostname <GITLAB_HOST> <project>
+                    cmd = [
+                        "glab",
+                        "repo",
+                        "fork",
+                        path,
+                        "--clone=false",
+                        "--hostname",
+                        GITLAB_HOST,
+                    ]
+                else:
+                    # gh repo fork --clone=false <project>
+                    cmd = ["gh", "repo", "fork", path, "--clone=false"]
+
                 result = subprocess.run(
-                    ["gh", "repo", "fork", path, "--clone=false"],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=30,
@@ -285,7 +297,7 @@ class AutoForkOperations:
                     # Check if already forked (not an error)
                     if "already exists" in result.stderr.lower() or "already forked" in result.stderr.lower():
                         logger.info(f"{path} already forked")
-                        fork_url = self._get_fork_url(repo.name)
+                        fork_url = self._get_fork_url(repo.name, repo.host)
                         self.forked_repos[repo.name] = fork_url
                     else:
                         error_msg = f"Failed to fork {path}: {result.stderr}"
@@ -293,7 +305,7 @@ class AutoForkOperations:
                         failed.append(repo.name)
                         continue
                 else:
-                    fork_url = self._get_fork_url(repo.name)
+                    fork_url = self._get_fork_url(repo.name, repo.host)
                     self.forked_repos[repo.name] = fork_url
                     logger.info(f"Forked {path} to {fork_url}")
 

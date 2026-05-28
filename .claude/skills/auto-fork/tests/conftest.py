@@ -8,6 +8,7 @@ import pytest
 # Test constants
 TEST_BOT_USERNAME = "test-bot"
 TEST_INSTANCE_ID = "test-instance"
+GITLAB_HOST = "gitlab.cee.redhat.com"  # Match constant from auto_fork.py
 
 # Test data - repos configuration for fixtures
 TEST_REPOS_CONFIG = {
@@ -20,8 +21,8 @@ TEST_REPOS_CONFIG = {
         "upstream": "https://github.com/TestOrg/test-repo-2.git",
     },
     "gitlab-repo": {
-        "url": "https://gitlab.cee.redhat.com/other-user/gitlab-repo.git",
-        "upstream": "https://gitlab.cee.redhat.com/TestOrg/gitlab-repo.git",
+        "url": f"https://{GITLAB_HOST}/other-user/gitlab-repo.git",
+        "upstream": f"https://{GITLAB_HOST}/TestOrg/gitlab-repo.git",
         "host": "gitlab",
     },
 }
@@ -31,6 +32,7 @@ TEST_REPOS_CONFIG = {
 def set_env_vars(monkeypatch):
     """Set required env vars for all tests."""
     monkeypatch.setenv("GH_USER_NAME", TEST_BOT_USERNAME)
+    monkeypatch.setenv("GL_USER_NAME", TEST_BOT_USERNAME)
     monkeypatch.setenv("BOT_INSTANCE_ID", TEST_INSTANCE_ID)
     monkeypatch.setenv("BOT_CONFIG_PATH", "test-config")
 

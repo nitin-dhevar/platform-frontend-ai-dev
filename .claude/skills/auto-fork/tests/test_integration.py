@@ -59,9 +59,10 @@ class TestEndToEndWorkflow:
         assert results[2].operation == "update_and_commit"
         assert results[2].status == OperationStatus.SUCCESS
 
-        # Verify repos were forked
-        assert len(integration_operations.forked_repos) == 1
+        # Verify repos were forked (includes GitLab repo now)
+        assert len(integration_operations.forked_repos) == 2
         assert "test-repo-2" in integration_operations.forked_repos
+        assert "gitlab-repo" in integration_operations.forked_repos
 
         # Verify config was updated
         with open(integration_operations.project_repos_path) as f:
@@ -102,11 +103,12 @@ class TestEndToEndWorkflow:
 
         integration_operations.execute_workflow()
 
-        # Verify multiple repos were forked
-        assert len(integration_operations.forked_repos) == 3
+        # Verify multiple repos were forked (includes GitLab repo)
+        assert len(integration_operations.forked_repos) == 4
         assert "test-repo-2" in integration_operations.forked_repos
         assert "test-repo-3" in integration_operations.forked_repos
         assert "test-repo-4" in integration_operations.forked_repos
+        assert "gitlab-repo" in integration_operations.forked_repos
 
     @patch("auto_fork.subprocess.run")
     def test_workflow_handles_existing_forks(self, mock_run, integration_operations):
@@ -115,8 +117,8 @@ class TestEndToEndWorkflow:
         def mock_run_side_effect(cmd, *args, **kwargs):
             result = Mock()
 
-            # gh repo fork fails for existing fork
-            if cmd[0] == "gh" and "fork" in cmd:
+            # Both gh and glab repo fork fail for existing forks
+            if (cmd[0] == "gh" or cmd[0] == "glab") and "fork" in cmd:
                 result.returncode = 1
                 result.stderr = "repository already exists"
             elif "symbolic-ref" in cmd:
@@ -133,9 +135,9 @@ class TestEndToEndWorkflow:
 
         results = integration_operations.execute_workflow()
 
-        # Should still succeed
+        # Should still succeed (both GitHub and GitLab repos)
         assert results[1].status == OperationStatus.SUCCESS
-        assert len(integration_operations.forked_repos) == 1
+        assert len(integration_operations.forked_repos) == 2
 
     @patch("auto_fork.subprocess.run")
     def test_workflow_partial_failure(self, mock_run, integration_operations, temp_config_dir):
@@ -208,8 +210,10 @@ class TestConfigFileHandling:
         with open(integration_operations.project_repos_path) as f:
             updated_repos = json.load(f)
 
+        # test-repo-1 already has a fork, so should be unchanged
         assert updated_repos["test-repo-1"] == original_repos["test-repo-1"]
-        assert updated_repos["gitlab-repo"] == original_repos["gitlab-repo"]
+        # gitlab-repo is now forked, so it should be updated
+        assert updated_repos["gitlab-repo"]["url"] != original_repos["gitlab-repo"]["url"]
 
     @patch("auto_fork.subprocess.run")
     def test_json_formatting(self, mock_run, integration_operations):

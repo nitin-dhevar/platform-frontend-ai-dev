@@ -32,7 +32,8 @@ GitLab repos are skipped with a logged notice (manual forking required).
 
 Env vars (auto-provided by runtime):
 
-- `GH_USER_NAME` — bot GH username (fork destination)
+- `GH_USER_NAME` — bot GH username
+- `GL_USER_NAME` — bot GL username
 - `BOT_CONFIG_PATH` — config dir (default `rehor-config`)
 - `BOT_INSTANCE_ID` — instance ID (optional, for branch naming)
 
@@ -40,7 +41,7 @@ Env vars (auto-provided by runtime):
 
 Repos w/ `upstream` but `url` not matching bot account → need fork.
 - GH: check `url` contains `github.com/{GH_USER_NAME}/` → fork via `gh repo fork`
-- GL: logged + skipped (use `glab api` for manual fork)
+- GL: check `url` contains `gitlab.cee.redhat.com/{GL_USER_NAME}/` → fork via `glab repo fork --hostname gitlab.cee.redhat.com`
 
 ## Workflow
 
