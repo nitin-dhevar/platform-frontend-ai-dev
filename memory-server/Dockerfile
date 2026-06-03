@@ -28,7 +28,11 @@ RUN uv sync --frozen --no-dev
 
 # Pre-download the embedding model so startup doesn't need HuggingFace
 RUN uv run python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" \
-    && rm -rf /opt/app-root/src/.cache/uv
+    && rm -rf /opt/app-root/src/.cache/uv \
+    && chmod -R a+rX /opt/app-root/src/.cache/huggingface
+
+# Offline mode — model is baked in, no network/cache writes needed at runtime
+ENV HF_HUB_OFFLINE=1
 
 EXPOSE 8080
 
