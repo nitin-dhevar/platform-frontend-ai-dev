@@ -63,12 +63,8 @@ def register_cycle_tools(mcp: FastMCP):
 
         resolved_task_id = task_id if task_id and task_id > 0 else None
 
-        parsed_started = (
-            datetime.fromisoformat(started_at) if started_at else None
-        )
-        parsed_finished = (
-            datetime.fromisoformat(finished_at) if finished_at else None
-        )
+        parsed_started = datetime.fromisoformat(started_at) if started_at else None
+        parsed_finished = datetime.fromisoformat(finished_at) if finished_at else None
 
         row = await pool.fetchrow(
             f"""

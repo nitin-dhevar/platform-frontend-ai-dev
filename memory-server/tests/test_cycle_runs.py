@@ -111,7 +111,9 @@ async def test_post_cycle_run_with_transcript(mock_pool):
 @pytest.mark.asyncio
 async def test_post_cycle_run_no_task(mock_pool):
     mock_pool.fetchrow = AsyncMock(
-        side_effect=lambda q, *a: _fake_cycle_run_row(id=2, task_id=None, cycle_type="idle")
+        side_effect=lambda q, *a: _fake_cycle_run_row(
+            id=2, task_id=None, cycle_type="idle"
+        )
     )
     body = {
         "cycle_type": "idle",
@@ -311,7 +313,9 @@ def mock_pool_for_tools():
     pool.fetch = AsyncMock(
         return_value=[
             _fake_cycle_run_row(id=1),
-            _fake_cycle_run_row(id=2, progress=json.dumps({"last_step": "tests_passing"})),
+            _fake_cycle_run_row(
+                id=2, progress=json.dumps({"last_step": "tests_passing"})
+            ),
         ]
     )
     with patch("src.tools.cycles.get_pool", return_value=pool):

@@ -888,9 +888,7 @@ async def api_cycle_runs_add(request: Request) -> JSONResponse:
     started_at = body.get("started_at")
     finished_at = body.get("finished_at")
     parsed_started = datetime.fromisoformat(started_at) if started_at else None
-    parsed_finished = (
-        datetime.fromisoformat(finished_at) if finished_at else None
-    )
+    parsed_finished = datetime.fromisoformat(finished_at) if finished_at else None
 
     progress = body.get("progress")
     if isinstance(progress, str):
@@ -940,9 +938,7 @@ async def api_cycle_run_transcript(request: Request) -> Response:
         "SELECT transcript FROM cycle_runs WHERE id = $1", int(run_id)
     )
     if not row:
-        return JSONResponse(
-            {"error": f"Cycle run {run_id} not found"}, status_code=404
-        )
+        return JSONResponse({"error": f"Cycle run {run_id} not found"}, status_code=404)
 
     transcript = row["transcript"]
     if transcript is None:
